@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "hwcloudpd"
+version = "0.1.0"
+description = "Unattended Docker & CLI synchronizer for Huawei Cloud Space Gallery (icloudpd parity)"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+hwcloudpd = "hwcloudpd.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/tuber0613/hwcloudpd"
+Repository = "https://github.com/tuber0613/hwcloudpd"
+
+[tool.setuptools.packages.find]
+where = ["src"]
