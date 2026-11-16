@@ -189,8 +189,24 @@ def _build_minimal_app1_segment(dt: datetime) -> bytes:
     return b"\xff\xe1" + struct.pack(">H", len(app1_payload) + 2) + app1_payload
 
 
+def _app0_end_offset(data: bytes) -> int:
+    """Return the offset right after a leading JFIF/JFXX APP0 segment (or 2 if none)."""
+    if len(data) >= 6 and data[2:4] == b"\xff\xe0":
+        seg_len = struct.unpack_from(">H", data, 4)[0]
+        end = 4 + seg_len
+        if seg_len >= 2 and end <= len(data):
+            return end
+    return 2
+
+
 def inject_exif_datetime_if_missing(path: Path, dt: datetime) -> bool:
-    """Losslessly inject EXIF DateTimeOriginal into a JPEG lacking it (preserves Motion Photo MP4)."""
+    """Losslessly add EXIF DateTimeOriginal to a JPEG that has **no EXIF block at all**.
+
+    If the file already carries an APP1 Exif segment (even one lacking DateTimeOriginal) it is
+    left untouched: prepending a second Exif segment would shadow the original one (Orientation,
+    GPS, camera model) for most readers. The new segment is placed after a JFIF APP0 segment so
+    the file stays JFIF-compliant. Trailing data (Motion Photo MP4) is preserved byte-for-byte.
+    """
     try:
         data = path.read_bytes()
     except OSError:
@@ -199,14 +215,12 @@ def inject_exif_datetime_if_missing(path: Path, dt: datetime) -> bool:
     if len(data) < 4 or data[:2] != b"\xff\xd8":
         return False
 
-    tiff = _find_app1_exif_tiff(data[: 256 * 1024])
-    if tiff is not None:
-        has_orig, _ = _parse_tiff_exif_datetime(tiff)
-        if has_orig:
-            return False
+    if _find_app1_exif_tiff(data) is not None:
+        return False
 
+    insert_at = _app0_end_offset(data)
     app1_segment = _build_minimal_app1_segment(dt)
-    new_data = b"\xff\xd8" + app1_segment + data[2:]
+    new_data = data[:insert_at] + app1_segment + data[insert_at:]
 
     tmp_path = path.with_name(f".{path.name}.exif.tmp")
     tmp_path.write_bytes(new_data)

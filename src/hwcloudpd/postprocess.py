@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 import os
 from pathlib import Path
@@ -9,6 +10,7 @@ import re
 import struct
 import xml.etree.ElementTree as ET
 
+from hwcloudpd.fileutil import checksum_matches, hash_file
 from hwcloudpd.models import MediaItem
 from hwcloudpd.store import StateStore
 
@@ -24,28 +26,129 @@ def sanitize_component(name: str, *, fallback: str = "unnamed") -> str:
     return cleaned
 
 
-def format_folder_path(folder_structure: str, dt: datetime, album_name: str) -> str:
-    """Render relative subfolder path from `--folder-structure` template."""
-    template = folder_structure.strip()
-    if not template or template.lower() == "none":
-        return ""
-
+def _render_folder_template(template: str, dt: datetime, album_name: str) -> str:
     safe_album = sanitize_component(album_name, fallback="default")
     sentinel = "__HWCLOUD_ALBUM_TOKEN__"
     rendered = template.replace("{album}", sentinel)
     try:
         rendered = rendered.format(dt)
-    except Exception:
-        # Fallback if a format template without positional datetime syntax was provided.
-        rendered = dt.strftime("%Y/%m/%d")
-    rendered = rendered.replace(sentinel, safe_album)
+    except (IndexError, KeyError, ValueError, AttributeError) as exc:
+        raise ValueError(
+            f"无效的 --folder-structure 模板 '{template}': {exc}. "
+            "示例: '{:%Y/%m/%d}'、'{album}/{:%Y/%m}' 或 'none'"
+        ) from exc
+    return rendered.replace(sentinel, safe_album)
 
+
+def validate_folder_structure(folder_structure: str) -> None:
+    """Raise ValueError if the folder template cannot be rendered."""
+    template = (folder_structure or "").strip()
+    if not template or template.lower() == "none":
+        return
+    _render_folder_template(template, datetime(2001, 2, 3, 4, 5, 6), "album")
+
+
+def format_folder_path(folder_structure: str, dt: datetime, album_name: str) -> str:
+    """Render relative subfolder path from `--folder-structure` template.
+
+    Raises ValueError for malformed templates instead of silently changing the layout.
+    """
+    template = folder_structure.strip()
+    if not template or template.lower() == "none":
+        return ""
+
+    rendered = _render_folder_template(template, dt, album_name)
     parts = [
         sanitize_component(part, fallback="unknown")
         for part in rendered.replace("\\", "/").split("/")
         if part and part not in {".", ".."}
     ]
     return "/".join(parts)
+
+
+@dataclass
+class TargetDecision:
+    """Outcome of local path resolution for one cloud item."""
+
+    path: Path
+    # True when an identical file already exists at `path` and should simply be claimed.
+    adopt: bool = False
+    local_sha256: str = ""
+
+
+def _file_matches_item(path: Path, item: MediaItem) -> tuple[bool, str]:
+    """Return (matches, sha256) if the on-disk file is byte-identical to the cloud original."""
+    if item.file_size <= 0:
+        return False, ""
+    try:
+        if not path.is_file() or path.stat().st_size != item.file_size:
+            return False, ""
+        sha, md5, _ = hash_file(path)
+    except OSError:
+        return False, ""
+    verdict = checksum_matches(item.checksum, sha, md5)
+    # Without a cloud checksum, fall back to icloudpd semantics: same name + same size.
+    return (verdict is None or verdict), sha
+
+
+def resolve_target(
+    root_dir: Path,
+    *,
+    folder_structure: str,
+    file_match_policy: str,
+    item: MediaItem,
+    dt: datetime,
+    store: StateStore,
+    reserved: set[Path] | None = None,
+    allow_adopt: bool = True,
+) -> TargetDecision:
+    """Determine the local path for `item`, never overwriting a file that belongs to another item.
+
+    * A path recorded in the state DB for *this* uniqueId is reused (re-download in place).
+    * An untracked file that is byte-identical to the cloud original is adopted (no download).
+    * Anything else occupying a candidate name forces the next candidate
+      (`name`, `name-<size>`, `name-<id7>`, `name-<id12>`, `name-<id7>-N`).
+    """
+    reserved = reserved if reserved is not None else set()
+    rel_folder = format_folder_path(folder_structure, dt, item.album_name)
+    raw_name = sanitize_component(item.file_name, fallback=f"{item.unique_id[:12]}.jpg")
+    stem = Path(raw_name).stem or item.unique_id[:12]
+    suffix = Path(raw_name).suffix
+    if not suffix:
+        suffix = ".mp4" if item.is_video else ".jpg"
+
+    def _rel(name: str) -> str:
+        return f"{rel_folder}/{name}" if rel_folder else name
+
+    if file_match_policy == "name-id7":
+        names = [f"{stem}_{item.unique_id[:7]}{suffix}", f"{stem}_{item.unique_id[:12]}{suffix}"]
+    else:
+        names = [f"{stem}{suffix}"]
+        if item.file_size > 0:
+            names.append(f"{stem}-{item.file_size}{suffix}")
+        names.append(f"{stem}-{item.unique_id[:7]}{suffix}")
+        names.append(f"{stem}-{item.unique_id[:12]}{suffix}")
+    names.extend(f"{stem}-{item.unique_id[:7]}-{n}{suffix}" for n in range(2, 1000))
+
+    for name in names:
+        rel = _rel(name)
+        abs_path = root_dir / rel
+        if abs_path in reserved:
+            continue
+        existing = store.find_by_rel_path(rel)
+        if existing is not None:
+            if existing["unique_id"] == item.unique_id:
+                return TargetDecision(abs_path)
+            continue
+        if abs_path.exists():
+            if allow_adopt:
+                matches, sha = _file_matches_item(abs_path, item)
+                if matches:
+                    return TargetDecision(abs_path, adopt=True, local_sha256=sha)
+            continue
+        return TargetDecision(abs_path)
+
+    raise ValueError(f"Could not find a free local file name for {item.file_name} ({item.unique_id})")
 
 
 def resolve_target_path(
@@ -57,46 +160,15 @@ def resolve_target_path(
     dt: datetime,
     store: StateStore,
 ) -> Path:
-    """Determine final local file path, handling icloudpd-style deduplication policies."""
-    rel_folder = format_folder_path(folder_structure, dt, item.album_name)
-    raw_name = sanitize_component(item.file_name, fallback=f"{item.unique_id[:12]}.jpg")
-    stem = Path(raw_name).stem or item.unique_id[:12]
-    suffix = Path(raw_name).suffix
-    if not suffix:
-        suffix = ".mp4" if item.is_video else ".jpg"
-
-    if file_match_policy == "name-id7":
-        candidate_name = f"{stem}_{item.unique_id[:7]}{suffix}"
-        rel_path = f"{rel_folder}/{candidate_name}" if rel_folder else candidate_name
-        return root_dir / rel_path
-
-    # Default: name-size-dedup-with-suffix
-    def _is_occupied_by_other(rel_candidate: str) -> bool:
-        existing = store.find_by_rel_path(rel_candidate)
-        if existing is not None and existing["unique_id"] != item.unique_id:
-            return True
-        abs_candidate = root_dir / rel_candidate
-        if abs_candidate.exists():
-            if existing is not None and existing["unique_id"] == item.unique_id:
-                return False
-            # File exists on disk without a matching state record for this unique_id.
-            return True
-        return False
-
-    base_name = f"{stem}{suffix}"
-    rel_base = f"{rel_folder}/{base_name}" if rel_folder else base_name
-    if not _is_occupied_by_other(rel_base):
-        return root_dir / rel_base
-
-    if item.file_size > 0:
-        sized_name = f"{stem}-{item.file_size}{suffix}"
-        rel_sized = f"{rel_folder}/{sized_name}" if rel_folder else sized_name
-        if not _is_occupied_by_other(rel_sized):
-            return root_dir / rel_sized
-
-    id_name = f"{stem}-{item.unique_id[:7]}{suffix}"
-    rel_id = f"{rel_folder}/{id_name}" if rel_folder else id_name
-    return root_dir / rel_id
+    """Backward-compatible wrapper returning only the resolved path."""
+    return resolve_target(
+        root_dir,
+        folder_structure=folder_structure,
+        file_match_policy=file_match_policy,
+        item=item,
+        dt=dt,
+        store=store,
+    ).path
 
 
 def _find_embedded_mp4_span(data: bytes) -> tuple[int, int] | None:

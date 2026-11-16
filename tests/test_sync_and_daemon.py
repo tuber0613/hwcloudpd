@@ -567,8 +567,12 @@ class SyncAndDaemonTests(unittest.TestCase):
                 )
                 move_rep = SyncEngine(move_cfg, client, store).run_once()
                 self.assertEqual(move_rep.deleted_cloud, 1)
-                self.assertEqual(store.get_record("old_fav")["status"], "deleted_cloud")
+                # Local status stays "downloaded"; the cloud side is tracked separately.
+                self.assertEqual(store.get_record("old_fav")["status"], "downloaded")
+                self.assertEqual(store.get_record("old_fav")["cloud_state"], "deleted")
                 self.assertEqual(store.get_record("recent_vid")["status"], "downloaded")
+                self.assertEqual(store.get_record("recent_vid")["cloud_state"], "present")
+                old_fav_path = photos_dir / store.get_record("old_fav")["local_rel_path"]
 
                 # Now move recent_vid into cloud Recycle Bin and test --auto-delete
                 rec_vid_item = server.items_by_album["default-album-1"].pop(0)
@@ -589,6 +593,9 @@ class SyncAndDaemonTests(unittest.TestCase):
                 self.assertFalse(rec_vid_path.exists())
                 self.assertFalse(Path(f"{rec_vid_path}.xmp").exists())
                 self.assertEqual(store.get_record("recent_vid")["status"], "deleted_local")
+                # old_fav sits in the Recycle Bin because *we* moved it: its backup must survive.
+                self.assertTrue(old_fav_path.is_file())
+                self.assertEqual(store.get_record("old_fav")["status"], "downloaded")
             finally:
                 store.close()
 
@@ -776,13 +783,36 @@ class SyncAndDaemonTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertTrue((cli_cfg_dir / "auth.json").is_file())
 
-            # Missing health.json -> unhealthy (1); fresh health.json -> healthy (0)
-            self.assertEqual(cli_main(["--config-dir", str(cli_cfg_dir), "--healthcheck"]), 1)
+            # One-shot mode has nothing to monitor -> always healthy.
+            self.assertEqual(cli_main(["--config-dir", str(cli_cfg_dir), "--healthcheck"]), 0)
+            # Daemon mode: missing health.json -> unhealthy (1); fresh health.json -> healthy (0)
+            hc = ["--config-dir", str(cli_cfg_dir), "--watch-with-interval", "3600", "--healthcheck"]
+            self.assertEqual(cli_main(hc), 1)
             (cli_cfg_dir / "health.json").write_text(
                 json.dumps({"ok": True, "updated_at": time.time()}),
                 encoding="utf-8",
             )
-            self.assertEqual(cli_main(["--config-dir", str(cli_cfg_dir), "--healthcheck"]), 0)
+            self.assertEqual(cli_main(hc), 0)
+            # Invalid session -> unhealthy
+            (cli_cfg_dir / "health.json").write_text(
+                json.dumps({"ok": True, "auth_valid": False, "updated_at": time.time()}),
+                encoding="utf-8",
+            )
+            self.assertEqual(cli_main(hc), 1)
+            # Sync stuck for longer than max_sync_hours -> unhealthy
+            (cli_cfg_dir / "health.json").write_text(
+                json.dumps(
+                    {
+                        "ok": True,
+                        "auth_valid": True,
+                        "updated_at": time.time(),
+                        "sync_started_at": time.time() - 3 * 3600,
+                        "max_sync_hours": 2,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(cli_main(hc), 1)
 
     def test_daemon_silent_auto_relogin_and_lockout_safety(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -851,26 +881,37 @@ class SyncAndDaemonTests(unittest.TestCase):
                 )
 
                 async def scenario() -> None:
-                    # 1. Expired session -> silent auto-relogin succeeds with ZERO alerts!
+                    def auth_alerts() -> list[str]:
+                        return [a for a in alerts if "首次同步完成" not in a]
+
+                    # 1. Expired session -> silent auto-relogin succeeds with ZERO auth alerts!
                     self.assertTrue(await daemon.keepalive_step())
                     self.assertEqual(fake_auth.calls, 1)
-                    self.assertEqual(len(alerts), 0)
+                    self.assertEqual(len(auth_alerts()), 0)
                     report = await daemon.execute_sync_once()
                     self.assertIsNotNone(report)
                     assert report is not None
                     self.assertEqual(report.downloaded, 1)
 
-                    # 2. Session expires and requires 2FA -> notifies once and enters cooldown
+                    # 2. Session expires and requires 2FA -> notifies once and blocks password
+                    #    re-submission until the user acts (no code push / SMS every cycle).
                     server.auth_valid = False
                     fake_auth.mode = "2fa"
                     self.assertFalse(await daemon.keepalive_step())
                     self.assertFalse(await daemon.keepalive_step())
+                    daemon._auto_relogin_blocked_until = 0.0  # time-based expiry alone must not unblock
+                    self.assertFalse(await daemon.keepalive_step())
                     self.assertEqual(fake_auth.calls, 2)
-                    self.assertEqual(len(alerts), 1)
-                    self.assertIn("--auth-only", alerts[0])
+                    self.assertEqual(len(auth_alerts()), 1)
+                    self.assertIn("--auth-only", auth_alerts()[0])
+                    health = json.loads((cfg_dir / "health.json").read_text(encoding="utf-8"))
+                    self.assertFalse(health["auth_valid"])
+                    self.assertEqual(health["auth_block_reason"], "two_factor_required")
 
-                    # 3. Invalid password latches permanently to prevent account lockout
-                    daemon._auto_relogin_blocked_until = 0.0
+                    # 3. User touches credentials (e.g. --auth-only) -> block lifted; an invalid
+                    #    password then latches permanently to prevent account lockout.
+                    future_t = time.time() + 30
+                    os.utime(mgr.auth_file, (future_t, future_t))
                     fake_auth.mode = "bad_pw"
                     self.assertFalse(await daemon.keepalive_step())
                     self.assertFalse(await daemon.keepalive_step())

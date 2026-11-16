@@ -14,6 +14,7 @@ import threading
 import time
 from typing import Iterable
 
+from hwcloudpd.fileutil import exclusive_file_lock
 from hwcloudpd.models import AuthExpiredError, AuthSession
 
 logger = logging.getLogger(__name__)
@@ -250,16 +251,22 @@ def parse_curl_command(
 
 
 class AuthManager:
-    """Thread-safe credential store supporting curl.txt auto-import and auth.json hot-reload."""
+    """Thread- and process-safe credential store with curl.txt import and auth.json hot-reload."""
 
     def __init__(self, config_dir: Path | str) -> None:
         self.config_dir = Path(config_dir)
         self.auth_file = self.config_dir / "auth.json"
         self.curl_file = self.config_dir / "curl.txt"
+        self.lock_file = self.config_dir / "auth.lock"
         self._lock = threading.RLock()
         self._session: AuthSession | None = None
         self._last_auth_mtime: float = -1.0
         self._last_curl_mtime: float = -1.0
+        # Human-readable description of the last rejected curl.txt / auth.json, for alerts.
+        self.last_import_error: str = ""
+
+    def _file_lock(self):
+        return exclusive_file_lock(self.lock_file, timeout_sec=30.0)
 
     def ensure_session(self) -> AuthSession:
         """Return the current AuthSession, reloading if files changed, or raise AuthExpiredError."""
@@ -280,6 +287,15 @@ class AuthManager:
                 return None
             return AuthSession.from_dict(self._session.to_dict())
 
+    def _quarantine(self, path: Path, suffix: str) -> Path | None:
+        target = path.with_name(f"{path.name}.{suffix}")
+        try:
+            os.replace(path, target)
+            return target
+        except OSError as exc:
+            logger.warning("Could not move aside %s: %s", path, exc)
+            return None
+
     def load_or_reload(self) -> bool:
         """Check for new curl.txt or updated auth.json. Return True if session changed."""
         with self._lock:
@@ -294,25 +310,37 @@ class AuthManager:
                     if raw_curl.strip():
                         prev_uid = self._session.user_id if self._session else ""
                         prev_dev = self._session.device_id if self._session else ""
-                        session = parse_curl_command(
-                            raw_curl,
-                            fallback_user_id=prev_uid,
-                            fallback_device_id=prev_dev,
-                        )
-                        self.save(session)
-                        imported_path = self.config_dir / "curl.txt.imported"
                         try:
-                            os.replace(self.curl_file, imported_path)
-                        except OSError as exc:
-                            logger.warning("Could not archive %s: %s", self.curl_file, exc)
-                        self._last_curl_mtime = curl_mtime
-                        logger.info(
-                            "Imported credentials from %s into %s (userid=%s)",
-                            self.curl_file,
-                            self.auth_file,
-                            session.user_id,
-                        )
-                        return True
+                            session = parse_curl_command(
+                                raw_curl,
+                                fallback_user_id=prev_uid,
+                                fallback_device_id=prev_dev,
+                            )
+                        except ValueError as exc:
+                            # Move the bad file aside so we don't re-parse (and re-log) it forever.
+                            moved = self._quarantine(self.curl_file, "invalid")
+                            self._last_curl_mtime = curl_mtime
+                            self.last_import_error = (
+                                f"{self.curl_file.name} 无法解析，已重命名为 "
+                                f"{moved.name if moved else self.curl_file.name}: {exc}"
+                            )
+                            logger.error("%s", self.last_import_error)
+                        else:
+                            self.save(session)
+                            imported_path = self.config_dir / "curl.txt.imported"
+                            try:
+                                os.replace(self.curl_file, imported_path)
+                            except OSError as exc:
+                                logger.warning("Could not archive %s: %s", self.curl_file, exc)
+                            self._last_curl_mtime = curl_mtime
+                            self.last_import_error = ""
+                            logger.info(
+                                "Imported credentials from %s into %s (userid=%s)",
+                                self.curl_file,
+                                self.auth_file,
+                                session.user_id,
+                            )
+                            return True
 
             if self.auth_file.exists():
                 try:
@@ -320,8 +348,21 @@ class AuthManager:
                 except OSError:
                     return False
                 if self._session is None or auth_mtime > self._last_auth_mtime:
-                    data = json.loads(self.auth_file.read_text(encoding="utf-8"))
-                    self._session = AuthSession.from_dict(data)
+                    try:
+                        data = json.loads(self.auth_file.read_text(encoding="utf-8"))
+                        if not isinstance(data, dict):
+                            raise ValueError("top-level JSON value is not an object")
+                        session = AuthSession.from_dict(data)
+                    except (ValueError, TypeError) as exc:
+                        moved = self._quarantine(self.auth_file, f"corrupt-{int(time.time())}")
+                        self.last_import_error = (
+                            f"{self.auth_file.name} 已损坏（{exc}），已移至 "
+                            f"{moved.name if moved else '?'}，需要重新登录"
+                        )
+                        logger.error("%s", self.last_import_error)
+                        self._session = None
+                        return False
+                    self._session = session
                     self._last_auth_mtime = auth_mtime
                     changed = True
                     logger.debug("Loaded auth session from %s", self.auth_file)
@@ -341,83 +382,123 @@ class AuthManager:
             return AuthSession.from_dict(session.to_dict())
 
     def save(self, session: AuthSession) -> None:
-        """Atomically persist AuthSession to auth.json with 0600 permissions."""
-        with self._lock:
-            self.config_dir.mkdir(parents=True, exist_ok=True)
-            session.updated_at = time.time()
-            tmp_path = self.config_dir / f".auth.{os.getpid()}.{threading.get_ident()}.tmp"
-            payload = json.dumps(session.to_dict(), ensure_ascii=False, indent=2) + "\n"
-            tmp_path.write_text(payload, encoding="utf-8")
-            try:
-                os.chmod(tmp_path, 0o600)
-            except OSError:
-                pass
-            os.replace(tmp_path, self.auth_file)
-            self._session = AuthSession.from_dict(session.to_dict())
-            try:
-                self._last_auth_mtime = self.auth_file.stat().st_mtime
-            except OSError:
-                self._last_auth_mtime = time.time()
+        """Atomically persist AuthSession to auth.json with 0600 permissions (cross-process locked)."""
+        with self._lock, self._file_lock():
+            self._save_unlocked(session)
+
+    def _save_unlocked(self, session: AuthSession) -> None:
+        self.config_dir.mkdir(parents=True, exist_ok=True)
+        session.updated_at = time.time()
+        tmp_path = self.config_dir / f".auth.{os.getpid()}.{threading.get_ident()}.tmp"
+        payload = json.dumps(session.to_dict(), ensure_ascii=False, indent=2) + "\n"
+        tmp_path.write_text(payload, encoding="utf-8")
+        try:
+            os.chmod(tmp_path, 0o600)
+        except OSError:
+            pass
+        os.replace(tmp_path, self.auth_file)
+        self._session = AuthSession.from_dict(session.to_dict())
+        try:
+            self._last_auth_mtime = self.auth_file.stat().st_mtime
+        except OSError:
+            self._last_auth_mtime = time.time()
+
+    def _disk_is_newer(self) -> bool:
+        try:
+            return self.auth_file.stat().st_mtime > self._last_auth_mtime
+        except OSError:
+            return False
 
     def update_from_response(
         self,
         set_cookie_headers: Iterable[str],
         response_headers: dict[str, str],
     ) -> bool:
-        """Merge Set-Cookie headers and rotated csrftoken header into persisted auth.json."""
+        """Merge Set-Cookie headers and rotated csrftoken header into persisted auth.json.
+
+        If another process (e.g. `docker exec hwcloudpd hwcloudpd --auth-only`) wrote a newer
+        auth.json since we loaded ours, the fresher on-disk session wins and this response's
+        rotation (which belongs to the stale session) is discarded instead of overwriting it.
+        """
         with self._lock:
             if self._session is None:
                 return False
-
-            changed = False
-            cookies = dict(self._session.cookies)
-            csrf = self._session.csrf_token
-
-            for raw_cookie in set_cookie_headers:
-                parsed = SimpleCookie()
-                try:
-                    parsed.load(raw_cookie)
-                except Exception:
-                    continue
-                for name, morsel in parsed.items():
-                    max_age = morsel.get("max-age")
-                    if max_age is not None and str(max_age).strip() == "0":
-                        if name in cookies:
-                            del cookies[name]
-                            changed = True
-                        continue
-                    val = morsel.value
-                    if val and cookies.get(name) != val:
-                        cookies[name] = val
-                        changed = True
-
-            # Check case-insensitive csrftoken header returned by Huawei backend.
-            for k, v in response_headers.items():
-                if k.lower() == "csrftoken" and v.strip():
-                    new_csrf = v.strip()
-                    if new_csrf != csrf:
-                        csrf = new_csrf
-                        changed = True
-                    if cookies.get("shareToken") != new_csrf:
-                        cookies["shareToken"] = new_csrf
-                        changed = True
-
-            if "shareToken" in cookies and cookies["shareToken"] != csrf and not any(
+            set_cookie_headers = list(set_cookie_headers)
+            has_csrf_header = any(
                 k.lower() == "csrftoken" and v.strip() for k, v in response_headers.items()
-            ):
-                csrf = cookies["shareToken"]
-                changed = True
+            )
+            if not set_cookie_headers and not has_csrf_header:
+                return False
 
-            if changed:
-                updated = AuthSession(
-                    cookies=cookies,
-                    csrf_token=csrf,
-                    user_id=self._session.user_id,
-                    device_id=self._session.device_id,
-                    user_agent=self._session.user_agent,
-                    extra_headers=dict(self._session.extra_headers),
-                    updated_at=time.time(),
-                )
-                self.save(updated)
-                logger.debug("Persisted rotated session cookies/CSRFToken to %s", self.auth_file)
+            stale = False
+            with self._file_lock():
+                if self._disk_is_newer():
+                    stale = True
+                else:
+                    changed = self._merge_rotation_unlocked(
+                        set_cookie_headers, response_headers, has_csrf_header
+                    )
+            if stale:
+                logger.info("auth.json was updated by another process; reloading instead of merging")
+                self._session = None
+                self.load_or_reload()
+                return False
             return changed
+
+    def _merge_rotation_unlocked(
+        self,
+        set_cookie_headers: list[str],
+        response_headers: dict[str, str],
+        has_csrf_header: bool,
+    ) -> bool:
+        assert self._session is not None
+        changed = False
+        cookies = dict(self._session.cookies)
+        csrf = self._session.csrf_token
+
+        for raw_cookie in set_cookie_headers:
+            parsed = SimpleCookie()
+            try:
+                parsed.load(raw_cookie)
+            except Exception:
+                continue
+            for name, morsel in parsed.items():
+                max_age = morsel.get("max-age")
+                if max_age is not None and str(max_age).strip() == "0":
+                    if name in cookies:
+                        del cookies[name]
+                        changed = True
+                    continue
+                val = morsel.value
+                if val and cookies.get(name) != val:
+                    cookies[name] = val
+                    changed = True
+
+        # Check case-insensitive csrftoken header returned by Huawei backend.
+        for k, v in response_headers.items():
+            if k.lower() == "csrftoken" and v.strip():
+                new_csrf = v.strip()
+                if new_csrf != csrf:
+                    csrf = new_csrf
+                    changed = True
+                if cookies.get("shareToken") != new_csrf:
+                    cookies["shareToken"] = new_csrf
+                    changed = True
+
+        if "shareToken" in cookies and cookies["shareToken"] != csrf and not has_csrf_header:
+            csrf = cookies["shareToken"]
+            changed = True
+
+        if changed:
+            updated = AuthSession(
+                cookies=cookies,
+                csrf_token=csrf,
+                user_id=self._session.user_id,
+                device_id=self._session.device_id,
+                user_agent=self._session.user_agent,
+                extra_headers=dict(self._session.extra_headers),
+                updated_at=time.time(),
+            )
+            self._save_unlocked(updated)
+            logger.debug("Persisted rotated session cookies/CSRFToken to %s", self.auth_file)
+        return changed

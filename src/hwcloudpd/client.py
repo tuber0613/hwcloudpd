@@ -2,19 +2,19 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import gzip
 import hashlib
 import json
 import logging
-import os
 from pathlib import Path
 import random
 import ssl
+import threading
 import time
 from typing import Any, Iterator, Protocol
 import urllib.error
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import unquote, urlparse
 import urllib.request
 import zlib
 
@@ -318,6 +318,33 @@ def _response_code_str(data: dict[str, Any]) -> str:
     return ""
 
 
+@dataclass
+class CloudDeleteResult:
+    """Per-item outcome of a Recycle Bin move request.
+
+    * `deleted`: confirmed moved to the Recycle Bin.
+    * `failed`: definitely NOT moved (rejected by the server, skipped, or never attempted).
+    * `unknown`: request outcome unknown (network error mid-request) - must be reconciled later.
+    """
+
+    deleted: list[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
+    unknown: list[str] = field(default_factory=list)
+    aborted_error: Exception | None = None
+
+
+_SHARED_LIST_KEYS = {"shareAlbumList", "sharedAlbumList", "shareAlbumInfoList"}
+_KNOWN_LIST_KEYS = {"ownAlbumList", "albumList", "albumInfoList", "normalAlbumList"} | _SHARED_LIST_KEYS
+
+
+def _media_ext_for_type(file_type: str) -> str:
+    if file_type == "4":
+        return ".mp4"
+    if file_type == "9":
+        return ".heic"
+    return ".jpg"
+
+
 class HuaweiGalleryClient:
     """Protocol client implementing Huawei Cloud Space Gallery Web APIs."""
 
@@ -335,6 +362,35 @@ class HuaweiGalleryClient:
         self.base_url = base_url.rstrip("/")
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
+        self._preprocess_lock = threading.Lock()
+        self._preprocess_at: float = 0.0
+        self.preprocess_ttl_sec: float = 600.0
+
+    def _probe_session(self) -> AuthExpiredError | None:
+        """Return an AuthExpiredError if a heartbeat proves the session is dead, else None."""
+        try:
+            self.heartbeat_check()
+        except AuthExpiredError as exc:
+            return exc
+        except HwCloudError as exc:
+            logger.debug("Session probe inconclusive: %s", exc)
+        return None
+
+    def _ensure_ok(self, data: dict[str, Any], what: str, *, allow_empty_code: bool = False) -> None:
+        """Validate a business response code; distinguish expired sessions from other errors.
+
+        Huawei endpoints often answer HTTP 200 with a non-zero business code when the session
+        expired. Error codes are undocumented, so instead of guessing we probe /heartbeatCheck:
+        if the heartbeat fails the caller gets AuthExpiredError (-> re-login flow), otherwise a
+        plain HwCloudError.
+        """
+        code = _response_code_str(data)
+        if code == "0" or (allow_empty_code and code == ""):
+            return
+        expired = self._probe_session()
+        if expired is not None:
+            raise AuthExpiredError(f"{what} failed (code={code!r}); session expired: {expired}") from expired
+        raise HwCloudError(f"{what} failed: {data}")
 
     def _build_api_headers(
         self,
@@ -427,10 +483,26 @@ class HuaweiGalleryClient:
                     raise AuthExpiredError(f"Session redirected to login ({loc or resp.status})")
                 raise HwCloudError(f"Unexpected redirect {resp.status} from {path} to {loc}")
 
-            if resp.status in (401, 402, 403):
+            if resp.status in (401, 402):
                 raise AuthExpiredError(
                     f"HTTP {resp.status} from {path}: session expired or gallery locked (requires loginSecLevel=2)"
                 )
+
+            if resp.status == 403:
+                # 403 is also used by the WAF / anti-abuse layer; only treat it as an expired
+                # session when an independent heartbeat confirms it.
+                if path == "/heartbeatCheck":
+                    raise AuthExpiredError(f"HTTP 403 from {path}: session expired")
+                expired = self._probe_session()
+                if expired is not None:
+                    raise AuthExpiredError(f"HTTP 403 from {path}: {expired}") from expired
+                last_exc = RateLimitError(
+                    f"HTTP 403 from {path} while session is still valid (WAF / rate limiting?)"
+                )
+                if attempt < self.max_retries:
+                    time.sleep(self.retry_base_delay * (2**attempt) * 4 + random.uniform(0.1, 0.5))
+                    continue
+                raise last_exc
 
             if resp.status == 429:
                 last_exc = RateLimitError(f"HTTP 429 rate limited on {path}")
@@ -499,9 +571,7 @@ class HuaweiGalleryClient:
             trace_module=TRACE_GALLERY_ID,
             payload={},
         )
-        code = _response_code_str(data)
-        if code != "0":
-            raise HwCloudError(f"galleryStatInfo failed: {data}")
+        self._ensure_ok(data, "galleryStatInfo")
         return {
             "photoNum": int(data.get("photoNum") or 0),
             "videoNum": int(data.get("videoNum") or 0),
@@ -516,9 +586,10 @@ class HuaweiGalleryClient:
             trace_module=TRACE_GALLERY_ID,
             payload={"isHash": False, "language": "zh_cn"},
         )
-        code = _response_code_str(data)
-        if code and code != "0":
-            raise HwCloudError(f"queryAlbumInfo failed: {data}")
+        self._ensure_ok(data, "queryAlbumInfo", allow_empty_code=True)
+
+        session = self.auth_manager.get_session_if_present()
+        self_user_id = session.user_id if session else ""
 
         albums_by_id: dict[str, AlbumInfo] = {
             "default-album-1": AlbumInfo(album_id="default-album-1", name="相机"),
@@ -531,7 +602,7 @@ class HuaweiGalleryClient:
             ),
         }
 
-        def _ingest_album_list(items: Any, *, default_owner: str | None = None) -> None:
+        def _ingest_album_list(items: Any, *, shared: bool = False) -> None:
             if not isinstance(items, list):
                 return
             for entry in items:
@@ -551,27 +622,34 @@ class HuaweiGalleryClient:
                 name = str(raw_name or aid).strip()
                 if aid in SYSTEM_ALBUM_NAMES and (not raw_name or raw_name == aid):
                     name = SYSTEM_ALBUM_NAMES[aid]
-                owner = entry.get("ownerId") or entry.get("createrId") or default_owner
+                owner = entry.get("ownerId") or entry.get("createrId")
+                owner_str = str(owner) if owner else None
+                # Albums owned by someone else are shared albums even if listed elsewhere.
+                is_shared = shared or bool(
+                    owner_str and self_user_id and owner_str != self_user_id
+                )
                 albums_by_id[aid] = AlbumInfo(
                     album_id=aid,
                     name=name,
                     album_version=str(entry.get("albumVersion") or ""),
-                    owner_id=str(owner) if owner else None,
+                    owner_id=owner_str,
                     img_num=int(entry.get("imgNum") or entry.get("photoNum") or 0),
                     video_num=int(entry.get("videoNum") or 0),
                     hide=int(entry.get("hide") or 0),
                     is_virtual=aid in VIRTUAL_ALBUM_TYPE_MAP,
                     is_recycle=(aid == "default-album-3"),
+                    is_shared=is_shared,
                 )
 
         # Extract from known keys as well as any list containing album objects.
-        for key in ("ownAlbumList", "albumList", "albumInfoList", "normalAlbumList", "shareAlbumList"):
+        for key in ("ownAlbumList", "albumList", "albumInfoList", "normalAlbumList"):
             if key in data:
                 _ingest_album_list(data.get(key))
         for key, val in data.items():
-            if key not in {"ownAlbumList", "albumList", "albumInfoList", "normalAlbumList", "shareAlbumList"}:
-                if isinstance(val, list) and val and isinstance(val[0], dict) and "albumId" in val[0]:
-                    _ingest_album_list(val)
+            if key in _KNOWN_LIST_KEYS and key not in _SHARED_LIST_KEYS:
+                continue
+            if isinstance(val, list) and val and isinstance(val[0], dict) and "albumId" in val[0]:
+                _ingest_album_list(val, shared=(key in _SHARED_LIST_KEYS or "share" in key.lower()))
 
         if include_stats:
             query_ids = [aid for aid in albums_by_id if aid not in VIRTUAL_ALBUM_TYPE_MAP]
@@ -620,6 +698,7 @@ class HuaweiGalleryClient:
                             hide=int(st.get("hide") or existing.hide),
                             is_virtual=existing.is_virtual,
                             is_recycle=existing.is_recycle,
+                            is_shared=existing.is_shared,
                         )
 
         return list(albums_by_id.values())
@@ -656,9 +735,7 @@ class HuaweiGalleryClient:
                 trace_module=TRACE_SIMPLE_ID,
                 payload=payload,
             )
-            code = _response_code_str(data)
-            if code != "0":
-                raise HwCloudError(f"getSimpleFile failed for album={album_id}: {data}")
+            self._ensure_ok(data, f"getSimpleFile(album={album_id})")
 
             raw_list = data.get("fileList") or []
             if not raw_list:
@@ -714,9 +791,7 @@ class HuaweiGalleryClient:
             trace_module=TRACE_BURST_ID,
             payload={"albumId": album_id, "uniqueId": unique_id},
         )
-        code = _response_code_str(data)
-        if code != "0":
-            raise HwCloudError(f"burstphotolist failed for {unique_id}: {data}")
+        self._ensure_ok(data, f"burstphotolist({unique_id})")
 
         bursts: list[MediaStub] = []
         for entry in data.get("burstIdList") or []:
@@ -768,9 +843,7 @@ class HuaweiGalleryClient:
                     trace_module=TRACE_QUERY_ID,
                     payload=payload,
                 )
-                code = _response_code_str(data)
-                if code != "0":
-                    raise HwCloudError(f"queryCloudFileName failed: {data}")
+                self._ensure_ok(data, "queryCloudFileName")
                 rows = data.get("fileList") or data.get("successList") or []
                 for row in rows:
                     uid = str(row.get("uniqueId") or "").strip()
@@ -830,10 +903,11 @@ class HuaweiGalleryClient:
             meta = enriched.get(s.unique_id, {})
             file_name = str(meta.get("fileName") or meta.get("name") or s.file_name or "").strip()
             file_type = str(meta.get("fileType") or s.file_type or "1")
+            name_synthesized = False
             if not file_name:
-                ext = ".mp4" if file_type == "4" else ".jpg"
                 prefix = "VID" if file_type == "4" else "IMG"
-                file_name = f"{prefix}_{s.unique_id[:12]}{ext}"
+                file_name = f"{prefix}_{s.unique_id[:12]}{_media_ext_for_type(file_type)}"
+                name_synthesized = True
 
             raw_size = meta.get("fileSize")
             if raw_size is None:
@@ -862,26 +936,34 @@ class HuaweiGalleryClient:
                     album_version=s.album_version,
                     owner_id=s.owner_id,
                     expand=expand,
+                    is_shared=s.is_shared,
+                    name_synthesized=name_synthesized,
                 )
             )
         return items
 
-    def pre_process(self) -> None:
-        """Warm up download signing session via POST /proxyserver/driveFileProxy/preProcess."""
-        data = self._request_json(
-            "POST",
-            "/proxyserver/driveFileProxy/preProcess",
-            trace_module=TRACE_QUERY_ID,
-            payload={
-                "needToSignUrl": "",
-                "httpMethod": "GET",
-                "generateSignFlag": False,
-            },
-            inject_trace_into_payload=False,
-        )
-        code = _response_code_str(data)
-        if code != "0":
-            raise HwCloudError(f"preProcess failed: {data}")
+    def pre_process(self, *, force: bool = False) -> None:
+        """Warm up download signing session via POST /proxyserver/driveFileProxy/preProcess.
+
+        The warm-up is cached for `preprocess_ttl_sec` so per-item callers don't add one extra
+        request per download.
+        """
+        with self._preprocess_lock:
+            if not force and (time.monotonic() - self._preprocess_at) < self.preprocess_ttl_sec and self._preprocess_at > 0:
+                return
+            data = self._request_json(
+                "POST",
+                "/proxyserver/driveFileProxy/preProcess",
+                trace_module=TRACE_QUERY_ID,
+                payload={
+                    "needToSignUrl": "",
+                    "httpMethod": "GET",
+                    "generateSignFlag": False,
+                },
+                inject_trace_into_payload=False,
+            )
+            self._ensure_ok(data, "preProcess")
+            self._preprocess_at = time.monotonic()
 
     def get_download_url(self, item: MediaItem, size_variant: str = "original") -> str:
         """Exchange item identity for a pre-signed download URL via POST /album/getSingleUrl."""
@@ -910,9 +992,7 @@ class HuaweiGalleryClient:
             trace_module=TRACE_QUERY_ID,
             payload=payload,
         )
-        code = _response_code_str(data)
-        if code != "0":
-            raise HwCloudError(f"getSingleUrl failed for {item.unique_id}: {data}")
+        self._ensure_ok(data, f"getSingleUrl({item.unique_id})")
 
         url_list = data.get("urlList") or []
         if url_list and isinstance(url_list[0], dict) and url_list[0].get("url"):
@@ -968,39 +1048,85 @@ class HuaweiGalleryClient:
         assert last_exc is not None
         raise last_exc
 
-    def delete_cloud_files(self, items: list[MediaItem]) -> int:
-        """Move downloaded items to Huawei Cloud Recycle Bin via POST /album/deleteAlbumFile."""
+    def delete_cloud_files(self, items: list[MediaItem]) -> CloudDeleteResult:
+        """Move items to the Huawei Cloud Recycle Bin via POST /album/deleteAlbumFile.
+
+        Safety rules:
+        * Items in shared albums (or owned by someone else) are never touched.
+        * `recycle` is always "1" (move to Recycle Bin, never hard-delete).
+        * The result reports confirmed / rejected / unknown items separately so the caller can
+          keep its state database exact even after partial failures.
+        """
+        result = CloudDeleteResult()
         if not items:
-            return 0
+            return result
 
         grouped: dict[tuple[str, str | None, str], list[str]] = {}
         for item in items:
+            if item.is_shared:
+                logger.warning(
+                    "Refusing to delete shared-album item %s (%s) from the cloud",
+                    item.file_name,
+                    item.unique_id,
+                )
+                result.failed.append(item.unique_id)
+                continue
             key = (item.album_id, item.owner_id, item.album_version or "")
             grouped.setdefault(key, []).append(item.unique_id)
 
-        deleted_count = 0
-        for (album_id, owner_id, album_ver), unique_ids in grouped.items():
+        batches: list[tuple[tuple[str, str | None, str], list[str]]] = []
+        for key, unique_ids in grouped.items():
             for i in range(0, len(unique_ids), 200):
-                batch_ids = unique_ids[i : i + 200]
-                payload: dict[str, Any] = {
-                    "albumId": album_id,
-                    "recycle": "0" if owner_id else "1",
-                    "hash": [""],
-                    "uniqueId": batch_ids,
-                }
-                if album_ver:
-                    payload["albumVersion"] = album_ver
-                if owner_id:
-                    payload["ownerId"] = owner_id
+                batches.append((key, unique_ids[i : i + 200]))
+
+        for idx, ((album_id, owner_id, album_ver), batch_ids) in enumerate(batches):
+            payload: dict[str, Any] = {
+                "albumId": album_id,
+                "recycle": "1",
+                "hash": [""],
+                "uniqueId": batch_ids,
+            }
+            if album_ver:
+                payload["albumVersion"] = album_ver
+            if owner_id:
+                payload["ownerId"] = owner_id
+            try:
                 data = self._request_json(
                     "POST",
                     "/album/deleteAlbumFile",
                     trace_module=TRACE_DELETE_ID,
                     payload=payload,
                 )
-                code = _response_code_str(data)
-                if code != "0":
-                    raise HwCloudError(f"deleteAlbumFile failed: {data}")
-                success_list = data.get("successList")
-                deleted_count += len(success_list) if isinstance(success_list, list) else len(batch_ids)
-        return deleted_count
+            except AuthExpiredError as exc:
+                # A 401/redirect means the request was rejected, but be conservative: the current
+                # batch is "unknown", later batches were never sent and are definitely intact.
+                result.unknown.extend(batch_ids)
+                for _key, rest in batches[idx + 1 :]:
+                    result.failed.extend(rest)
+                result.aborted_error = exc
+                return result
+            except HwCloudError as exc:
+                logger.error("deleteAlbumFile request failed (outcome unknown): %s", exc)
+                result.unknown.extend(batch_ids)
+                continue
+
+            if _response_code_str(data) != "0":
+                logger.error("deleteAlbumFile rejected batch for album %s: %s", album_id, data)
+                result.failed.extend(batch_ids)
+                continue
+
+            success_list = data.get("successList")
+            if isinstance(success_list, list):
+                ok: set[str] = set()
+                for entry in success_list:
+                    if isinstance(entry, dict):
+                        uid = str(entry.get("uniqueId") or "").strip()
+                    else:
+                        uid = str(entry or "").strip()
+                    if uid:
+                        ok.add(uid)
+                for uid in batch_ids:
+                    (result.deleted if uid in ok else result.failed).append(uid)
+            else:
+                result.deleted.extend(batch_ids)
+        return result

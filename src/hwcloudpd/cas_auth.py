@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import html
-from http.cookiejar import Cookie, LWPCookieJar
+from http.cookiejar import LWPCookieJar
 import json
 import logging
 import os
@@ -19,19 +19,16 @@ import urllib.error
 from urllib.parse import parse_qs, quote_plus, urlencode, urljoin, urlparse
 import urllib.request
 
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - non-POSIX fallback
-    fcntl = None  # type: ignore[assignment]
-
 from hwcloudpd.auth import AuthManager
 from hwcloudpd.client import generate_trace_id
+from hwcloudpd.fileutil import LockTimeoutError, exclusive_file_lock
 from hwcloudpd.models import (
     AuthExpiredError,
     AuthSession,
     CaptchaRequiredError,
     HwCloudError,
     InvalidCredentialsError,
+    RateLimitError,
     TwoFactorRequiredError,
 )
 
@@ -224,13 +221,32 @@ class HuaweiCasAuthenticator:
         """Return True if Huawei ID credentials or an unexpired CASTGC cookie are available."""
         return self.has_credentials or self._has_cas_tgt()
 
+    def _jar_file_mtime(self) -> float:
+        try:
+            return self.cookie_jar_path.stat().st_mtime
+        except OSError:
+            return -1.0
+
     def _load_cookie_jar(self) -> None:
+        self._jar_mtime = self._jar_file_mtime()
         if not self.cookie_jar_path.exists():
             return
         try:
             self._cookie_jar.load(ignore_discard=True, ignore_expires=False)
         except Exception as exc:
             logger.debug("Could not load existing cookie jar %s: %s", self.cookie_jar_path, exc)
+
+    def _reload_cookie_jar_if_changed(self) -> None:
+        """Pick up a cookie jar written by another process (e.g. `--auth-only` via docker exec).
+
+        Without this, a long-running daemon would later save its stale in-memory jar over the
+        fresh one and lose the "trust this browser" cookies, forcing 2FA again.
+        """
+        if self._jar_file_mtime() == self._jar_mtime:
+            return
+        logger.info("Cookie jar %s changed on disk; reloading", self.cookie_jar_path)
+        self._cookie_jar.clear()
+        self._load_cookie_jar()
 
     def _save_cookie_jar(self) -> None:
         self.cookie_jar_path.parent.mkdir(parents=True, exist_ok=True)
@@ -241,34 +257,18 @@ class HuaweiCasAuthenticator:
         except OSError:
             pass
         os.replace(tmp, self.cookie_jar_path)
+        self._jar_mtime = self._jar_file_mtime()
 
     @contextmanager
     def _acquire_lock(self, timeout_sec: float = 30.0) -> Iterator[None]:
-        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
-        fh = self.lock_file.open("a+", encoding="utf-8")
         try:
-            if fcntl is not None:
-                deadline = time.monotonic() + timeout_sec
-                while True:
-                    try:
-                        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        break
-                    except BlockingIOError:
-                        if time.monotonic() >= deadline:
-                            raise HwCloudError(
-                                f"Timed out waiting for CAS auth lock {self.lock_file}"
-                            )
-                        time.sleep(0.2)
-            yield
-        finally:
-            if fcntl is not None:
-                try:
-                    fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
-                except OSError:
-                    pass
-            fh.close()
+            with exclusive_file_lock(self.lock_file, timeout_sec=timeout_sec):
+                yield
+        except LockTimeoutError as exc:
+            raise HwCloudError(f"Timed out waiting for CAS auth lock {self.lock_file}") from exc
 
     def _has_cas_tgt(self) -> bool:
+        self._reload_cookie_jar_if_changed()
         for cookie in self._cookie_jar:
             if cookie.name.upper().startswith("CASTGC") and cookie.value:
                 if not cookie.is_expired():
@@ -1167,6 +1167,7 @@ class HuaweiCasAuthenticator:
     ) -> AuthSession:
         """Execute pure-HTTP CAS authentication (plus Tier-2 authIdentify unlock) and persist session."""
         with self._acquire_lock():
+            self._reload_cookie_jar_if_changed()
             persisted_lsid = self._load_cas_state()
 
             # Fast-path 0: Resume pending 2FA when --two-fa-code is passed in a second non-TTY call.
@@ -1449,7 +1450,7 @@ class HuaweiCasAuthenticator:
                         "请通过浏览器完成一次登录后导出 config/curl.txt。"
                     )
                 elif err_code in _RATE_LIMIT_ERROR_CODES:
-                    raise HwCloudError(f"华为账号登录请求过于频繁 (errorCode={err_code}): {err_desc}")
+                    raise RateLimitError(f"华为账号登录请求过于频繁 (errorCode={err_code}): {err_desc}")
                 else:
                     raise AuthExpiredError(
                         f"华为账号登录未成功 (errorCode={err_code or 'unknown'}): {err_desc}"

@@ -88,6 +88,27 @@ def parse_date_bound(value: str | None, tz_name: str = "Asia/Shanghai", *, end_o
     return int(dt.timestamp() * 1000)
 
 
+def env_str(name: str, default: str | None = None) -> str | None:
+    """Read string environment variable, treating empty / whitespace-only values as unset.
+
+    Docker `env_file` passes `KEY=` lines through as empty strings; those must fall back to
+    the documented default rather than silently becoming "".
+    """
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip()
+
+
+def read_secret_file(path: str | None) -> str | None:
+    """Read a secret (e.g. password) from a file such as a Docker secret, stripping newline."""
+    if not path:
+        return None
+    with open(path, encoding="utf-8") as fh:
+        value = fh.read().rstrip("\r\n")
+    return value or None
+
+
 def env_bool(name: str, default: bool = False) -> bool:
     """Read boolean environment variable ('1', 'true', 'yes', 'on')."""
     raw = os.environ.get(name)
@@ -106,7 +127,10 @@ def env_int(name: str, default: int | None = None) -> int | None:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
         return default
-    return int(raw.strip())
+    try:
+        return int(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"环境变量 {name}={raw!r} 不是合法整数") from exc
 
 
 def env_float(name: str, default: float | None = None) -> float | None:
@@ -114,7 +138,10 @@ def env_float(name: str, default: float | None = None) -> float | None:
     raw = os.environ.get(name)
     if raw is None or not raw.strip():
         return default
-    return float(raw.strip())
+    try:
+        return float(raw.strip())
+    except ValueError as exc:
+        raise ValueError(f"环境变量 {name}={raw!r} 不是合法数字") from exc
 
 
 def env_list(name: str) -> list[str]:

@@ -31,6 +31,14 @@ class RateLimitError(HwCloudError):
     """Raised when Huawei Cloud endpoints throttle requests (HTTP 429 or busy)."""
 
 
+class SyncCancelledError(HwCloudError):
+    """Raised inside the sync engine when a graceful stop was requested."""
+
+
+class ConfigError(ValueError):
+    """Raised when the runtime configuration is invalid or self-contradictory."""
+
+
 @dataclass
 class AuthSession:
     """Persisted browser session credentials and client fingerprint for cloud.huawei.com."""
@@ -97,6 +105,7 @@ class AlbumInfo:
     hide: int = 0
     is_virtual: bool = False
     is_recycle: bool = False
+    is_shared: bool = False
 
 
 @dataclass
@@ -115,6 +124,7 @@ class MediaStub:
     album_version: str = ""
     owner_id: str | None = None
     recycle_time: str = ""
+    is_shared: bool = False
 
 
 @dataclass
@@ -135,6 +145,9 @@ class MediaItem:
     album_version: str = ""
     owner_id: str | None = None
     expand: dict = field(default_factory=dict)
+    is_shared: bool = False
+    # True when the cloud did not return a real file name and we synthesized one.
+    name_synthesized: bool = False
 
     @property
     def is_photo(self) -> bool:
@@ -196,6 +209,82 @@ class SyncConfig:
     telegram_chat_id: str | None = None
     notification_script: str | None = None
     log_level: str = "INFO"
+    max_sync_hours: float = 24.0
+
+    @property
+    def move_mode(self) -> bool:
+        """True when any option that moves cloud items to the Recycle Bin is enabled."""
+        return self.delete_after_download or self.keep_cloud_recent_days is not None
+
+    @property
+    def is_daemon(self) -> bool:
+        return bool(
+            (self.cron and self.cron.strip())
+            or (self.watch_interval is not None and self.watch_interval > 0)
+        )
+
+    def validate(self) -> None:
+        """Raise ConfigError describing every invalid / contradictory option."""
+        # Local imports keep models.py free of heavy module-level dependencies.
+        from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+        from hwcloudpd.cron import CronSchedule
+        from hwcloudpd.postprocess import validate_folder_structure
+
+        errors: list[str] = []
+
+        def _non_negative(name: str, value: int | float | None) -> None:
+            if value is not None and value < 0:
+                errors.append(f"{name} 不能为负数（当前 {value}）")
+
+        _non_negative("--recent", self.recent)
+        _non_negative("--until-found", self.until_found)
+        _non_negative("--keep-cloud-recent-days", self.keep_cloud_recent_days)
+        _non_negative("--min-size", self.min_size)
+        _non_negative("--max-size", self.max_size)
+        _non_negative("--watch-with-interval", self.watch_interval)
+        if self.until_found == 0:
+            errors.append("--until-found 必须 ≥ 1（不需要早停请不要设置该参数）")
+
+        if self.delete_after_download and self.keep_cloud_recent_days is not None:
+            errors.append(
+                "--delete-after-download 与 --keep-cloud-recent-days 不能同时使用，请二选一"
+            )
+        if self.skip_photos and self.skip_videos and self.skip_live_photos:
+            errors.append("--skip-photos、--skip-videos、--skip-live-photos 同时开启后没有任何内容可下载")
+        if (
+            self.min_size is not None
+            and self.max_size is not None
+            and self.min_size > self.max_size
+        ):
+            errors.append(f"--min-size ({self.min_size}) 大于 --max-size ({self.max_size})")
+        if (
+            self.created_after_ms is not None
+            and self.created_before_ms is not None
+            and self.created_after_ms > self.created_before_ms
+        ):
+            errors.append("--created-after 晚于 --created-before")
+        if self.move_mode and self.photo_size != "original":
+            errors.append("移动模式（删除云端原图）只允许在 --size original 下使用，否则会丢失原图")
+
+        try:
+            ZoneInfo(self.timezone)
+        except (ZoneInfoNotFoundError, ValueError) as exc:
+            errors.append(f"无效时区 '{self.timezone}': {exc}")
+
+        if self.cron and self.cron.strip():
+            try:
+                CronSchedule.parse(self.cron)
+            except ValueError as exc:
+                errors.append(f"无效 cron 表达式: {exc}")
+
+        try:
+            validate_folder_structure(self.folder_structure)
+        except ValueError as exc:
+            errors.append(str(exc))
+
+        if errors:
+            raise ConfigError("配置无效：\n  - " + "\n  - ".join(errors))
 
 
 @dataclass
@@ -204,18 +293,30 @@ class SyncReport:
 
     scanned: int = 0
     downloaded: int = 0
+    adopted: int = 0
+    redownloaded_changed: int = 0
     skipped_existing: int = 0
     skipped_filtered: int = 0
+    deferred_failed: int = 0
     deleted_local: int = 0
     deleted_cloud: int = 0
+    cloud_missing: int = 0
     failed: int = 0
+    cancelled: bool = False
+    full_scan: bool = False
     duration_sec: float = 0.0
 
     def summary_text(self) -> str:
         """Render a concise single-line summary for logs and notifications."""
-        return (
+        text = (
             f"scanned={self.scanned}, downloaded={self.downloaded}, "
+            f"adopted={self.adopted}, changed={self.redownloaded_changed}, "
             f"skipped_existing={self.skipped_existing}, skipped_filtered={self.skipped_filtered}, "
+            f"deferred_failed={self.deferred_failed}, "
             f"deleted_local={self.deleted_local}, deleted_cloud={self.deleted_cloud}, "
+            f"cloud_missing={self.cloud_missing}, "
             f"failed={self.failed}, duration={self.duration_sec:.2f}s"
         )
+        if self.cancelled:
+            text += " (cancelled)"
+        return text
