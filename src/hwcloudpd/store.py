@@ -21,6 +21,7 @@ STATUS_DELETED_LOCAL = "deleted_local"
 CLOUD_PRESENT = "present"
 CLOUD_DELETE_PENDING = "delete_pending"  # we asked Huawei to recycle it; outcome not yet confirmed
 CLOUD_DELETED = "deleted"  # confirmed moved to the Recycle Bin by hwcloudpd
+CLOUD_DELETE_FAILED = "delete_failed"  # still in the cloud; a move-mode deletion must be retried
 CLOUD_MISSING = "missing"  # no longer visible anywhere in the cloud (purged by user / expiry)
 
 _V2_COLUMNS: dict[str, str] = {

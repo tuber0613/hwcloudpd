@@ -35,6 +35,7 @@ from hwcloudpd.postprocess import (
     write_xmp_sidecar,
 )
 from hwcloudpd.store import (
+    CLOUD_DELETE_FAILED,
     CLOUD_DELETE_PENDING,
     CLOUD_DELETED,
     CLOUD_MISSING,
@@ -95,6 +96,7 @@ class _RunContext:
     pending: list[MediaStub] = field(default_factory=list)
     verify: list[MediaStub] = field(default_factory=list)
     replace_uids: set[str] = field(default_factory=set)
+    # Items downloaded / adopted / re-downloaded in *this* run (delete-after-download scope).
     backed_up_uids: set[str] = field(default_factory=set)
     reserved: set[Path] = field(default_factory=set)
     path_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -408,7 +410,6 @@ class SyncEngine:
                 break
 
     def _on_existing(self, stub: MediaStub, rec: dict[str, Any], ctx: _RunContext) -> None:
-        ctx.backed_up_uids.add(stub.unique_id)
         state = rec.get("cloud_state") or CLOUD_PRESENT
         if state in (CLOUD_DELETED, CLOUD_MISSING) and not ctx.is_dry:
             # Visible in a normal album again -> the user restored it from the Recycle Bin.
@@ -780,7 +781,7 @@ class SyncEngine:
         confirmed = [r["unique_id"] for r in pending if r["unique_id"] in recycled]
         not_deleted = [r["unique_id"] for r in pending if r["unique_id"] not in recycled]
         self.store.set_cloud_state(confirmed, CLOUD_DELETED)
-        self.store.set_cloud_state(not_deleted, CLOUD_PRESENT)
+        self.store.set_cloud_state(not_deleted, CLOUD_DELETE_FAILED)
         logger.info(
             "Reconciled %d pending cloud deletions: %d confirmed in Recycle Bin, %d still in cloud",
             len(pending),
@@ -837,11 +838,13 @@ class SyncEngine:
     ) -> list[MediaItem]:
         selected_ids = {a.album_id for a in target_albums}
         if self.config.delete_after_download:
-            records = [
-                r
-                for uid in ctx.backed_up_uids
-                if (r := self.store.get_record(uid)) is not None
-            ]
+            # Items backed up in this run, plus earlier move-mode deletions that failed.
+            uids = set(ctx.backed_up_uids)
+            uids.update(
+                r["unique_id"]
+                for r in self.store.iter_records(status=STATUS_DOWNLOADED, cloud_states=[CLOUD_DELETE_FAILED])
+            )
+            records = [r for uid in uids if (r := self.store.get_record(uid)) is not None]
         else:
             assert self.config.keep_cloud_recent_days is not None
             cutoff_ms = int(
@@ -849,14 +852,18 @@ class SyncEngine:
             )
             records = [
                 r
-                for r in self.store.iter_records(status=STATUS_DOWNLOADED, cloud_states=[CLOUD_PRESENT])
+                for r in self.store.iter_records(
+                    status=STATUS_DOWNLOADED, cloud_states=[CLOUD_PRESENT, CLOUD_DELETE_FAILED]
+                )
                 if 0 < int(r["create_time_ms"] or 0) < cutoff_ms
             ]
 
         candidates: list[MediaItem] = []
         skipped_shared = 0
         for rec in records:
-            if rec["status"] != STATUS_DOWNLOADED or (rec.get("cloud_state") or CLOUD_PRESENT) != CLOUD_PRESENT:
+            if rec["status"] != STATUS_DOWNLOADED:
+                continue
+            if (rec.get("cloud_state") or CLOUD_PRESENT) not in (CLOUD_PRESENT, CLOUD_DELETE_FAILED):
                 continue
             if rec["size_variant"] != "original":
                 continue
@@ -921,7 +928,7 @@ class SyncEngine:
         self.store.set_cloud_state(uids, CLOUD_DELETE_PENDING)
         result = self.client.delete_cloud_files(candidates)
         self.store.set_cloud_state(result.deleted, CLOUD_DELETED)
-        self.store.set_cloud_state(result.failed, CLOUD_PRESENT)
+        self.store.set_cloud_state(result.failed, CLOUD_DELETE_FAILED)
         ctx.report.deleted_cloud += len(result.deleted)
         logger.info(
             "Moved %d backed-up items to Huawei Cloud Recycle Bin (%d rejected, %d unknown)",

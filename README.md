@@ -201,7 +201,7 @@ hwcloudpd -d ./photos --watch-with-interval 3600 --until-found 50
 | 命令行参数 | 环境变量 | 默认值 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `--auto-delete` | `HWCLOUD_AUTO_DELETE` | `false` | **同步删除**：你在云端移入“最近删除”的照片，本地也同步清理（本工具自己移入回收站的不会删） |
-| `--delete-after-download` | `HWCLOUD_DELETE_AFTER_DOWNLOAD` | `false` | 本轮扫描中已确认本地备份的照片，将云端原文件移入“最近删除”（跳过共享相册） |
+| `--delete-after-download` | `HWCLOUD_DELETE_AFTER_DOWNLOAD` | `false` | 本轮新下载（或认领）并校验通过的照片，以及之前删除失败的照片，将云端原文件移入“最近删除”（跳过共享相册） |
 | `--keep-cloud-recent-days` | `HWCLOUD_KEEP_CLOUD_RECENT_DAYS` | - | 只在云端保留最近 N 天，超期且已备份项移入“最近删除”（遵守当前相册筛选，跳过共享相册；与上一项二选一） |
 | `--dry-run` | `HWCLOUD_DRY_RUN` | `false` | 演习模式，不真正下载或删除文件 |
 | `--only-print-filenames` | - | `false` | 只输出待下载文件路径 |

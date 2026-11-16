@@ -226,7 +226,40 @@ class MoveModeSafetyTests(unittest.TestCase):
                 ).run_once()
                 self.assertEqual(rep.deleted_cloud, 1)
                 states = sorted(store.get_record(u)["cloud_state"] for u in ("old_a", "old_b"))
-                self.assertEqual(states, ["deleted", "present"])
+                self.assertEqual(states, ["delete_failed", "deleted"])
+            finally:
+                store.close()
+
+    def test_delete_after_download_scope_and_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_dir, photos_dir, _, server, client, store = _setup(tmp)
+            try:
+                self._two_old_items(server)
+                # Backed up earlier WITHOUT move mode: must not be deleted just by enabling it.
+                SyncEngine(_cfg(photos_dir, cfg_dir, albums=["相机"]), client, store).run_once()
+                server.add_media(
+                    unique_id="fresh", album_id="default-album-1", file_name="FRESH.jpg",
+                    file_type="1", create_time_ms=_ts_ms(2026, 11, 1), content=_make_jpeg_bytes(b"fresh"),
+                )
+                orig = server.request
+
+                def reject(method, url, headers, body=None, **kw):
+                    if url.endswith("/album/deleteAlbumFile"):
+                        return HttpResponse(200, {}, [], json.dumps({"code": "500", "info": "busy"}).encode())
+                    return orig(method, url, headers, body, **kw)
+
+                server.request = reject  # type: ignore[method-assign]
+                move = _cfg(photos_dir, cfg_dir, albums=["相机"], delete_after_download=True)
+                rep = SyncEngine(move, client, store).run_once()
+                self.assertEqual((rep.downloaded, rep.deleted_cloud), (1, 0))
+                self.assertEqual(store.get_record("fresh")["cloud_state"], "delete_failed")
+                self.assertEqual(store.get_record("old_a")["cloud_state"], "present")
+
+                server.request = orig  # type: ignore[method-assign]
+                rep2 = SyncEngine(move, client, store).run_once()
+                self.assertEqual(rep2.deleted_cloud, 1)
+                self.assertEqual(store.get_record("fresh")["cloud_state"], "deleted")
+                self.assertEqual(store.get_record("old_a")["cloud_state"], "present")
             finally:
                 store.close()
 
