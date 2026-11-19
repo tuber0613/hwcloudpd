@@ -809,7 +809,8 @@ class HuaweiGalleryClient:
                 yield stubs
 
             has_more = _parse_api_bool(data.get("hasMore"))
-            if not has_more:
+            # Huawei Cloud may return hasMore=False even on full pages with more items remaining.
+            if not has_more and len(raw_list) < page_size:
                 break
             offset += len(raw_list)
             if request_delay_ms > 0:

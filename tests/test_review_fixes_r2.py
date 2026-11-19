@@ -659,6 +659,33 @@ class Round2ReliabilityAndEdgeCaseTests(unittest.TestCase):
                 pages2 = list(client.iter_simple_files("default-album-1"))
                 self.assertEqual(len(pages2), 1)
                 self.assertEqual(calls["n"], 3)
+
+                # Full page with hasMore=False must keep paginating until short/empty page
+                full_calls = {"n": 0}
+
+                def full_pages_false_has_more(method, url, headers, body=None, **kw):
+                    full_calls["n"] += 1
+                    off = json.loads(body.decode("utf-8")).get("currentNum", 0) if body else 0
+                    if off == 0:
+                        fl = [
+                            {"uniqueId": "p1_a", "albumId": "default-album-1", "fileType": "1", "createTime": 3},
+                            {"uniqueId": "p1_b", "albumId": "default-album-1", "fileType": "1", "createTime": 2},
+                        ]
+                    elif off == 2:
+                        fl = [{"uniqueId": "p2_a", "albumId": "default-album-1", "fileType": "1", "createTime": 1}]
+                    else:
+                        fl = []
+                    return HttpResponse(
+                        200,
+                        {},
+                        [],
+                        json.dumps({"resultCode": "0", "hasMore": False, "fileList": fl}).encode(),
+                    )
+
+                server.request = full_pages_false_has_more  # type: ignore[method-assign]
+                pages3 = list(client.iter_simple_files("default-album-1", page_size=2))
+                self.assertEqual([s.unique_id for p in pages3 for s in p], ["p1_a", "p1_b", "p2_a"])
+                self.assertEqual(full_calls["n"], 2)
             finally:
                 store.close()
 

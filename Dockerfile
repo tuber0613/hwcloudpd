@@ -18,6 +18,7 @@ COPY src ./src
 
 RUN printf '#!/bin/sh\nexec python3 -m hwcloudpd "$@"\n' > /usr/local/bin/hwcloudpd \
     && chmod +x /usr/local/bin/hwcloudpd \
+    && chmod -R a+rX /app \
     && mkdir -p /config /photos \
     && chmod 0755 /config /photos
 
