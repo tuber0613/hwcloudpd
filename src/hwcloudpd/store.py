@@ -11,7 +11,7 @@ from typing import Any, Iterable
 
 from hwcloudpd.models import MediaItem
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # Local-side status of a record.
 STATUS_DOWNLOADED = "downloaded"
@@ -30,6 +30,15 @@ _V2_COLUMNS: dict[str, str] = {
     "is_shared": "INTEGER NOT NULL DEFAULT 0",
     "cloud_state": f"TEXT NOT NULL DEFAULT '{CLOUD_PRESENT}'",
     "extra_paths": "TEXT NOT NULL DEFAULT '[]'",
+}
+
+_V3_SYNCED_COLUMNS: dict[str, str] = {
+    "is_fav": "INTEGER NOT NULL DEFAULT 0",
+    "cloud_delete_attempts": "INTEGER NOT NULL DEFAULT 0",
+}
+
+_V3_FAILURE_COLUMNS: dict[str, str] = {
+    "stub_json": "TEXT NOT NULL DEFAULT ''",
 }
 
 
@@ -79,6 +88,31 @@ class StateStore:
                 )
                 """
             )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS download_failures (
+                    unique_id TEXT PRIMARY KEY,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    last_attempt_at INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at INTEGER NOT NULL DEFAULT 0,
+                    stub_json TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            self._conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS burst_cache (
+                    cover_uid TEXT PRIMARY KEY,
+                    members_json TEXT NOT NULL,
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+            self._conn.execute(
+                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
+            )
+
             if version < 2:
                 self._conn.execute("BEGIN")
                 try:
@@ -91,6 +125,26 @@ class StateStore:
                         "UPDATE synced_media SET status = ?, cloud_state = ? WHERE status = 'deleted_cloud'",
                         (STATUS_DOWNLOADED, CLOUD_DELETED),
                     )
+                    self._conn.execute("PRAGMA user_version = 2")
+                    self._conn.execute("COMMIT")
+                    version = 2
+                except Exception:
+                    self._conn.execute("ROLLBACK")
+                    raise
+
+            if version < 3:
+                self._conn.execute("BEGIN")
+                try:
+                    existing_synced = self._columns("synced_media")
+                    for col, ddl in _V3_SYNCED_COLUMNS.items():
+                        if col not in existing_synced:
+                            self._conn.execute(f"ALTER TABLE synced_media ADD COLUMN {col} {ddl}")
+                    existing_fail = self._columns("download_failures")
+                    for col, ddl in _V3_FAILURE_COLUMNS.items():
+                        if col not in existing_fail:
+                            self._conn.execute(
+                                f"ALTER TABLE download_failures ADD COLUMN {col} {ddl}"
+                            )
                     self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                     self._conn.execute("COMMIT")
                 except Exception:
@@ -108,29 +162,6 @@ class StateStore:
             )
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_synced_media_cloud_state ON synced_media(cloud_state)"
-            )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS download_failures (
-                    unique_id TEXT PRIMARY KEY,
-                    attempts INTEGER NOT NULL DEFAULT 0,
-                    last_error TEXT NOT NULL DEFAULT '',
-                    last_attempt_at INTEGER NOT NULL DEFAULT 0,
-                    next_retry_at INTEGER NOT NULL DEFAULT 0
-                )
-                """
-            )
-            self._conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS burst_cache (
-                    cover_uid TEXT PRIMARY KEY,
-                    members_json TEXT NOT NULL,
-                    updated_at INTEGER NOT NULL
-                )
-                """
-            )
-            self._conn.execute(
-                "CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)"
             )
 
     def close(self) -> None:
@@ -196,20 +227,34 @@ class StateStore:
         size_variant: str,
         extra_paths: Iterable[str] | None = None,
     ) -> None:
-        """Insert or update a downloaded item record (cloud_state resets to present)."""
+        """Insert or update a downloaded item record (cloud_state resets to present).
+
+        When `extra_paths` is None, any existing sidecar paths recorded for this `unique_id`
+        are preserved on conflict instead of being wiped to `[]`.
+        """
         now_sec = int(time.time())
-        extras = json.dumps(sorted(set(extra_paths or [])), ensure_ascii=False)
+        extras_val = (
+            json.dumps(sorted(set(extra_paths)), ensure_ascii=False)
+            if extra_paths is not None
+            else None
+        )
+        extras_update = (
+            "extra_paths = excluded.extra_paths"
+            if extras_val is not None
+            else "extra_paths = synced_media.extra_paths"
+        )
         with self._lock:
             self._conn.execute("BEGIN")
             try:
                 self._conn.execute(
-                    """
+                    f"""
                     INSERT INTO synced_media (
                         unique_id, album_id, album_name, file_name, file_type,
                         file_size, checksum, local_sha256, create_time_ms,
                         local_rel_path, size_variant, status, synced_at,
-                        owner_id, album_version, is_shared, cloud_state, extra_paths
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        owner_id, album_version, is_shared, cloud_state, extra_paths,
+                        is_fav, cloud_delete_attempts
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)
                     ON CONFLICT(unique_id) DO UPDATE SET
                         album_id = excluded.album_id,
                         album_name = excluded.album_name,
@@ -227,7 +272,9 @@ class StateStore:
                         album_version = excluded.album_version,
                         is_shared = excluded.is_shared,
                         cloud_state = excluded.cloud_state,
-                        extra_paths = excluded.extra_paths
+                        {extras_update},
+                        is_fav = excluded.is_fav,
+                        cloud_delete_attempts = 0
                     """,
                     (
                         item.unique_id,
@@ -247,7 +294,8 @@ class StateStore:
                         item.album_version or "",
                         1 if item.is_shared else 0,
                         CLOUD_PRESENT,
-                        extras,
+                        extras_val if extras_val is not None else "[]",
+                        1 if item.is_fav else 0,
                     ),
                 )
                 self._conn.execute(
@@ -295,8 +343,36 @@ class StateStore:
                 (STATUS_DELETED_LOCAL, int(time.time()), unique_id),
             )
 
+    def update_is_fav(self, unique_id: str, is_fav: int) -> None:
+        """Update cached favorite flag for an existing synced record."""
+        with self._lock:
+            self._conn.execute(
+                "UPDATE synced_media SET is_fav = ? WHERE unique_id = ?",
+                (1 if is_fav else 0, unique_id),
+            )
+
     def set_cloud_state(self, unique_ids: Iterable[str], state: str) -> None:
         """Set cloud_state for many records atomically."""
+        ids = list(unique_ids)
+        if not ids:
+            return
+        reset_attempts = state in (CLOUD_PRESENT, CLOUD_DELETED, CLOUD_MISSING)
+        sql = (
+            "UPDATE synced_media SET cloud_state = ?, cloud_delete_attempts = 0 WHERE unique_id = ?"
+            if reset_attempts
+            else "UPDATE synced_media SET cloud_state = ? WHERE unique_id = ?"
+        )
+        with self._lock:
+            self._conn.execute("BEGIN")
+            try:
+                self._conn.executemany(sql, [(state, uid) for uid in ids])
+                self._conn.execute("COMMIT")
+            except Exception:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def increment_cloud_delete_attempts(self, unique_ids: Iterable[str]) -> None:
+        """Increment retry counter for items whose cloud deletion failed."""
         ids = list(unique_ids)
         if not ids:
             return
@@ -304,8 +380,9 @@ class StateStore:
             self._conn.execute("BEGIN")
             try:
                 self._conn.executemany(
-                    "UPDATE synced_media SET cloud_state = ? WHERE unique_id = ?",
-                    [(state, uid) for uid in ids],
+                    "UPDATE synced_media SET cloud_delete_attempts = cloud_delete_attempts + 1 "
+                    "WHERE unique_id = ?",
+                    [(uid,) for uid in ids],
                 )
                 self._conn.execute("COMMIT")
             except Exception:
@@ -362,30 +439,48 @@ class StateStore:
         unique_id: str,
         error: str,
         *,
+        stub: dict[str, Any] | None = None,
         base_delay_sec: int = 300,
         max_delay_sec: int = 86400,
     ) -> int:
         """Record a download failure and schedule an exponential-backoff retry. Return attempts."""
         now = int(time.time())
+        stub_str = json.dumps(stub, ensure_ascii=False) if stub is not None else ""
         with self._lock:
             row = self._conn.execute(
-                "SELECT attempts FROM download_failures WHERE unique_id = ?", (unique_id,)
+                "SELECT attempts, stub_json FROM download_failures WHERE unique_id = ?",
+                (unique_id,),
             ).fetchone()
             attempts = (int(row["attempts"]) if row else 0) + 1
+            if not stub_str and row is not None:
+                stub_str = str(row["stub_json"] or "")
             delay = min(max_delay_sec, base_delay_sec * (2 ** (attempts - 1)))
             self._conn.execute(
                 """
-                INSERT INTO download_failures (unique_id, attempts, last_error, last_attempt_at, next_retry_at)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO download_failures (
+                    unique_id, attempts, last_error, last_attempt_at, next_retry_at, stub_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(unique_id) DO UPDATE SET
                     attempts = excluded.attempts,
                     last_error = excluded.last_error,
                     last_attempt_at = excluded.last_attempt_at,
-                    next_retry_at = excluded.next_retry_at
+                    next_retry_at = excluded.next_retry_at,
+                    stub_json = excluded.stub_json
                 """,
-                (unique_id, attempts, str(error)[:500], now, now + delay),
+                (unique_id, attempts, str(error)[:500], now, now + delay, stub_str),
             )
             return attempts
+
+    def get_due_failures(self, now: float | None = None) -> list[dict[str, Any]]:
+        """Return previously failed downloads whose backoff window has elapsed."""
+        ts = int(now if now is not None else time.time())
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM download_failures WHERE next_retry_at <= ? ORDER BY last_attempt_at ASC",
+                (ts,),
+            ).fetchall()
+            return [dict(r) for r in rows]
 
     def is_failure_deferred(self, unique_id: str, now: float | None = None) -> bool:
         """True if a previous failure's backoff window has not elapsed yet."""

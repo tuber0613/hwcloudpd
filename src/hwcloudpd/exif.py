@@ -6,6 +6,7 @@ from datetime import datetime
 import os
 from pathlib import Path
 import struct
+import threading
 from zoneinfo import ZoneInfo
 
 _EXIF_HEADER = b"Exif\x00\x00"
@@ -222,7 +223,11 @@ def inject_exif_datetime_if_missing(path: Path, dt: datetime) -> bool:
     app1_segment = _build_minimal_app1_segment(dt)
     new_data = data[:insert_at] + app1_segment + data[insert_at:]
 
-    tmp_path = path.with_name(f".{path.name}.exif.tmp")
-    tmp_path.write_bytes(new_data)
-    os.replace(tmp_path, path)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.{threading.get_ident()}.exif.tmp")
+    try:
+        tmp_path.write_bytes(new_data)
+        os.replace(tmp_path, path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return True

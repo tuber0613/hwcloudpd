@@ -12,7 +12,7 @@ import random
 import ssl
 import threading
 import time
-from typing import Any, Iterator, Protocol
+from typing import Any, Callable, Iterator, Protocol
 import urllib.error
 from urllib.parse import unquote, urlparse
 import urllib.request
@@ -27,6 +27,7 @@ from hwcloudpd.models import (
     MediaItem,
     MediaStub,
     RateLimitError,
+    SyncCancelledError,
 )
 
 logger = logging.getLogger(__name__)
@@ -122,15 +123,18 @@ class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+_SENSITIVE_REDIRECT_HEADERS = {"cookie", "csrftoken", "authorization", "userid"}
+
+
 class _SafeCrossOriginRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
         new_req = super().redirect_request(req, fp, code, msg, headers, newurl)
         if new_req is not None and not _is_cloud_huawei_host(newurl):
             for key in list(new_req.headers):
-                if key.lower() == "cookie":
+                if key.lower() in _SENSITIVE_REDIRECT_HEADERS:
                     new_req.headers.pop(key, None)
             for key in list(new_req.unredirected_hdrs):
-                if key.lower() == "cookie":
+                if key.lower() in _SENSITIVE_REDIRECT_HEADERS:
                     new_req.unredirected_hdrs.pop(key, None)
         return new_req
 
@@ -190,6 +194,8 @@ def _hash_existing_file(path: Path) -> tuple[Any, Any, int]:
 class UrllibTransport:
     """Pure-stdlib HTTP transport built on urllib.request."""
 
+    _supports_stop = True
+
     def __init__(self, ssl_context: ssl.SSLContext | None = None) -> None:
         self._ssl_ctx = ssl_context or ssl.create_default_context()
         self._no_redirect_opener = urllib.request.build_opener(
@@ -246,7 +252,8 @@ class UrllibTransport:
         part_path: Path,
         *,
         resume_from: int = 0,
-        timeout: float = 120.0,
+        timeout: float = 30.0,
+        should_stop: Callable[[], bool] | None = None,
     ) -> DownloadResult:
         req_headers = dict(headers)
         if resume_from > 0:
@@ -271,6 +278,8 @@ class UrllibTransport:
 
                 with part_path.open(mode) as fh:
                     while True:
+                        if should_stop is not None and should_stop():
+                            raise SyncCancelledError("Download stopped by request")
                         chunk = resp.read(65536)
                         if not chunk:
                             break
@@ -292,14 +301,32 @@ class UrllibTransport:
                 except OSError:
                     pass
                 return self.stream_download(
-                    url, headers, part_path, resume_from=0, timeout=timeout
+                    url,
+                    headers,
+                    part_path,
+                    resume_from=0,
+                    timeout=timeout,
+                    should_stop=should_stop,
                 )
             raise
 
 
 def _is_cloud_huawei_host(url: str) -> bool:
-    host = (urlparse(url).hostname or "").lower()
+    parsed = urlparse(url)
+    if parsed.scheme.lower() != "https":
+        return False
+    host = (parsed.hostname or "").lower()
     return host == "cloud.huawei.com" or host.endswith(".cloud.huawei.com")
+
+
+def _parse_api_bool(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes"}
+    return False
 
 
 def _is_auth_redirect_location(location: str) -> bool:
@@ -722,6 +749,7 @@ class HuaweiGalleryClient:
             resolved_album_id = None
 
         offset = 0
+        seen_uids: set[str] = set()
         while True:
             payload = {
                 "albumId": resolved_album_id,
@@ -742,10 +770,14 @@ class HuaweiGalleryClient:
                 break
 
             stubs: list[MediaStub] = []
+            new_uids = 0
             for entry in raw_list:
                 uid = str(entry.get("uniqueId") or "").strip()
                 if not uid:
                     continue
+                if uid not in seen_uids:
+                    seen_uids.add(uid)
+                    new_uids += 1
                 item_aid = str(entry.get("albumId") or album_id or "")
                 stubs.append(
                     MediaStub(
@@ -764,10 +796,19 @@ class HuaweiGalleryClient:
                     )
                 )
 
+            if new_uids == 0:
+                logger.warning(
+                    "getSimpleFile(album=%s) returned a page of %d duplicate uniqueIds at offset=%d; stopping pagination",
+                    album_id,
+                    len(raw_list),
+                    offset,
+                )
+                break
+
             if stubs:
                 yield stubs
 
-            has_more = bool(data.get("hasMore"))
+            has_more = _parse_api_bool(data.get("hasMore"))
             if not has_more:
                 break
             offset += len(raw_list)
@@ -875,6 +916,8 @@ class HuaweiGalleryClient:
                         "type": "1",
                     },
                 )
+            except AuthExpiredError:
+                raise
             except HwCloudError as exc:
                 logger.debug("getThumbLcdUrl fallback failed: %s", exc)
                 continue
@@ -1001,7 +1044,13 @@ class HuaweiGalleryClient:
             return str(data["url"])
         raise HwCloudError(f"getSingleUrl returned no download URL for {item.unique_id}: {data}")
 
-    def download_to_part(self, url: str, part_path: Path) -> DownloadResult:
+    def download_to_part(
+        self,
+        url: str,
+        part_path: Path,
+        *,
+        should_stop: Callable[[], bool] | None = None,
+    ) -> DownloadResult:
         """Stream binary file into `part_path`, supporting Range resume without leaking cookies."""
         session = self.auth_manager.ensure_session()
         headers = {
@@ -1022,17 +1071,32 @@ class HuaweiGalleryClient:
 
         last_exc: Exception | None = None
         for attempt in range(self.max_retries + 1):
+            if should_stop is not None and should_stop():
+                raise SyncCancelledError("Download cancelled before attempt")
             try:
-                return self.transport.stream_download(
-                    url, headers, part_path, resume_from=resume_from, timeout=180.0
-                )
+                dl_kwargs: dict[str, Any] = {"resume_from": resume_from, "timeout": 30.0}
+                if should_stop is not None and getattr(self.transport, "_supports_stop", False):
+                    dl_kwargs["should_stop"] = should_stop
+                return self.transport.stream_download(url, headers, part_path, **dl_kwargs)
+            except SyncCancelledError:
+                raise
             except urllib.error.HTTPError as err:
                 if err.code in (401, 403):
-                    raise AuthExpiredError(
-                        f"Download URL unauthorized/expired (HTTP {err.code})"
+                    # A 401/403 on a pre-signed CDN URL may mean the signed URL expired or CDN
+                    # throttled this request while the Huawei Cloud session itself is still valid.
+                    expired = self._probe_session()
+                    if expired is not None:
+                        raise AuthExpiredError(
+                            f"Download URL unauthorized/expired (HTTP {err.code}); session expired: {expired}"
+                        ) from expired
+                    raise HwCloudError(
+                        f"Download URL returned HTTP {err.code} while session is valid "
+                        "(signed URL expired or CDN throttled)"
                     ) from err
                 last_exc = err
                 if err.code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
+                    if should_stop is not None and should_stop():
+                        raise SyncCancelledError("Download cancelled during retry") from err
                     time.sleep(self.retry_base_delay * (2**attempt))
                     resume_from = part_path.stat().st_size if part_path.exists() else 0
                     continue
@@ -1040,6 +1104,8 @@ class HuaweiGalleryClient:
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_exc = exc
                 if attempt < self.max_retries:
+                    if should_stop is not None and should_stop():
+                        raise SyncCancelledError("Download cancelled during retry") from exc
                     time.sleep(self.retry_base_delay * (2**attempt))
                     resume_from = part_path.stat().st_size if part_path.exists() else 0
                     continue

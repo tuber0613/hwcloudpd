@@ -13,6 +13,7 @@ import random
 import re
 import secrets
 import ssl
+import threading
 import time
 from typing import Any, Callable, Iterator
 import urllib.error
@@ -21,7 +22,7 @@ import urllib.request
 
 from hwcloudpd.auth import AuthManager
 from hwcloudpd.client import generate_trace_id
-from hwcloudpd.fileutil import LockTimeoutError, exclusive_file_lock
+from hwcloudpd.fileutil import LockTimeoutError, exclusive_file_lock, write_secret_file_atomic
 from hwcloudpd.models import (
     AuthExpiredError,
     AuthSession,
@@ -112,10 +113,30 @@ def _is_oauth_authorize_url(url: str) -> bool:
     parsed = urlparse(url)
     host = (parsed.hostname or "").lower()
     return (
-        host.startswith("oauth-login")
+        parsed.scheme.lower() == "https"
+        and host.startswith("oauth-login")
         and host.endswith(".cloud.huawei.com")
         and "/oauth2/" in parsed.path
     )
+
+
+def _validate_huawei_https_url(url: str, *, label: str) -> str:
+    """Ensure auth/CAS redirect & AJAX endpoints stay on HTTPS *.huawei.com."""
+    parsed = urlparse(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme.lower() != "https" or not (
+        host == "huawei.com" or host.endswith(".huawei.com")
+    ):
+        raise AuthExpiredError(f"拒绝不受信任的认证跳转地址 ({label}): {url!r}")
+    return url
+
+
+def _pick_pending_2fa_channel(channels: list[dict[str, Any]]) -> dict[str, Any]:
+    """Prefer a channel whose verification code was already sent (sent == 1)."""
+    for ch in channels:
+        if int(ch.get("sent") or 0) == 1:
+            return ch
+    return channels[0]
 
 
 def _deep_find_str(obj: Any, key: str) -> str:
@@ -199,6 +220,8 @@ class HuaweiCasAuthenticator:
         self.login_timeout_sec = max(10, int(login_timeout_sec))
         self.user_agent = AuthSession.user_agent
 
+        self._jar_lock = threading.RLock()
+        self._login_thread_lock = threading.Lock()
         self._cookie_jar = LWPCookieJar(str(self.cookie_jar_path))
         self._load_cookie_jar()
         self._custom_opener = opener
@@ -228,13 +251,14 @@ class HuaweiCasAuthenticator:
             return -1.0
 
     def _load_cookie_jar(self) -> None:
-        self._jar_mtime = self._jar_file_mtime()
-        if not self.cookie_jar_path.exists():
-            return
-        try:
-            self._cookie_jar.load(ignore_discard=True, ignore_expires=False)
-        except Exception as exc:
-            logger.debug("Could not load existing cookie jar %s: %s", self.cookie_jar_path, exc)
+        with self._jar_lock:
+            self._jar_mtime = self._jar_file_mtime()
+            if not self.cookie_jar_path.exists():
+                return
+            try:
+                self._cookie_jar.load(ignore_discard=True, ignore_expires=False)
+            except Exception as exc:
+                logger.debug("Could not load existing cookie jar %s: %s", self.cookie_jar_path, exc)
 
     def _reload_cookie_jar_if_changed(self) -> None:
         """Pick up a cookie jar written by another process (e.g. `--auth-only` via docker exec).
@@ -242,38 +266,39 @@ class HuaweiCasAuthenticator:
         Without this, a long-running daemon would later save its stale in-memory jar over the
         fresh one and lose the "trust this browser" cookies, forcing 2FA again.
         """
-        if self._jar_file_mtime() == self._jar_mtime:
-            return
-        logger.info("Cookie jar %s changed on disk; reloading", self.cookie_jar_path)
-        self._cookie_jar.clear()
-        self._load_cookie_jar()
+        with self._jar_lock:
+            if self._jar_file_mtime() == self._jar_mtime:
+                return
+            logger.info("Cookie jar %s changed on disk; reloading", self.cookie_jar_path)
+            self._cookie_jar.clear()
+            self._load_cookie_jar()
 
     def _save_cookie_jar(self) -> None:
-        self.cookie_jar_path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = self.cookie_jar_path.with_name(f".cas_cookies.{os.getpid()}.tmp")
-        self._cookie_jar.save(str(tmp), ignore_discard=True, ignore_expires=False)
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, self.cookie_jar_path)
-        self._jar_mtime = self._jar_file_mtime()
+        with self._jar_lock:
+            body = "#LWP-Cookies-2.0\n" + self._cookie_jar.as_lwp_str(
+                ignore_discard=True, ignore_expires=False
+            )
+            write_secret_file_atomic(self.cookie_jar_path, body, mode=0o600)
+            self._jar_mtime = self._jar_file_mtime()
 
     @contextmanager
     def _acquire_lock(self, timeout_sec: float = 30.0) -> Iterator[None]:
         try:
-            with exclusive_file_lock(self.lock_file, timeout_sec=timeout_sec):
+            with self._login_thread_lock, exclusive_file_lock(self.lock_file, timeout_sec=timeout_sec):
                 yield
         except LockTimeoutError as exc:
             raise HwCloudError(f"Timed out waiting for CAS auth lock {self.lock_file}") from exc
 
     def _has_cas_tgt(self) -> bool:
-        self._reload_cookie_jar_if_changed()
-        for cookie in self._cookie_jar:
-            if cookie.name.upper().startswith("CASTGC") and cookie.value:
-                if not cookie.is_expired():
-                    return True
-        return False
+        with self._jar_lock:
+            # Never clear/reload the in-memory jar while another thread is actively running login().
+            if not self._login_thread_lock.locked():
+                self._reload_cookie_jar_if_changed()
+            for cookie in self._cookie_jar:
+                if cookie.name.upper().startswith("CASTGC") and cookie.value:
+                    if not cookie.is_expired():
+                        return True
+            return False
 
     def _open_http(
         self,
@@ -384,25 +409,20 @@ class HuaweiCasAuthenticator:
         return parsed
 
     def _collect_portal_cookies(self) -> dict[str, str]:
-        portal_cookies: dict[str, str] = {}
-        for cookie in self._cookie_jar:
-            if not cookie.name or not cookie.value:
-                continue
-            if cookie.is_expired():
-                continue
-            if _is_portal_cookie_domain(cookie.domain):
-                portal_cookies[cookie.name] = cookie.value
-        return portal_cookies
+        with self._jar_lock:
+            portal_cookies: dict[str, str] = {}
+            for cookie in self._cookie_jar:
+                if not cookie.name or not cookie.value:
+                    continue
+                if cookie.is_expired():
+                    continue
+                if _is_portal_cookie_domain(cookie.domain):
+                    portal_cookies[cookie.name] = cookie.value
+            return portal_cookies
 
     def _write_json_atomic(self, target: Path, payload: dict[str, Any]) -> None:
-        target.parent.mkdir(parents=True, exist_ok=True)
-        tmp = target.with_name(f".{target.stem}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        try:
-            os.chmod(tmp, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp, target)
+        text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+        write_secret_file_atomic(target, text, mode=0o600)
 
     def _load_cas_state(self) -> str:
         if not self.cas_state_path.exists():
@@ -664,15 +684,16 @@ class HuaweiCasAuthenticator:
                 channels = pending.get("channels") or []
                 if channels:
                     return self._submit_cloud_auth_login(
-                        str(pending["ajax_base"]),
+                        _validate_huawei_https_url(str(pending["ajax_base"]), label="pending ajax_base"),
                         pending["state"],
-                        channels[0],
+                        _pick_pending_2fa_channel(channels),
                         str(pending.get("tips_scene_id") or ""),
                         interactive=interactive,
                         prompt_fn=prompt_fn,
                         output_fn=output_fn,
                     )
 
+        unlock_url = _validate_huawei_https_url(unlock_url, label="unlockUrl")
         parsed = urlparse(unlock_url)
         raw_qs = parsed.query
         flat_params = {k: v[-1] for k, v in parse_qs(raw_qs, keep_blank_values=True).items() if v}
@@ -714,7 +735,10 @@ class HuaweiCasAuthenticator:
         local_info = _normalize_local_info(page_info)
         state["local_info"] = local_info
         if local_info.get("localHttpsAjaxPath"):
-            resolved = urljoin(CAS_BASE_URL, str(local_info["localHttpsAjaxPath"]))
+            resolved = _validate_huawei_https_url(
+                urljoin(CAS_BASE_URL, str(local_info["localHttpsAjaxPath"])),
+                label="authIdentify localHttpsAjaxPath",
+            )
             ajax_base = resolved.rstrip("/") + "/ajaxHandler/"
 
         if page_info.get("redirectUrl"):
@@ -826,13 +850,16 @@ class HuaweiCasAuthenticator:
 
     def _complete_oauth2_authorize(self, authorize_url: str) -> str:
         """Complete Huawei OAuth2 v3 silent bridge (`/oauth2/v3/authorize` -> `/homeTransit`)."""
+        authorize_url = _validate_huawei_https_url(authorize_url, label="oauth2 authorize_url")
         parsed_auth = urlparse(authorize_url)
         oauth_origin = f"{parsed_auth.scheme or 'https'}://{parsed_auth.netloc}"
         auth_qs = parsed_auth.query
 
         way = self._oauth2_ajax_post(oauth_origin, "getLoginWay", auth_qs, authorize_url)
         if way.get("code"):
-            code_url = html.unescape(str(way["code"]))
+            code_url = _validate_huawei_https_url(
+                html.unescape(str(way["code"])), label="oauth2 code_url"
+            )
             _, final_url, _, _ = self._open_http(
                 "GET",
                 code_url,
@@ -847,6 +874,7 @@ class HuaweiCasAuthenticator:
         cas_redir = _deep_find_str(way.get("loginInteractInfo"), "casLoginRedirectUrl")
         if not cas_redir:
             raise AuthExpiredError("OAuth2 getLoginWay 未返回 casLoginRedirectUrl")
+        cas_redir = _validate_huawei_https_url(cas_redir, label="casLoginRedirectUrl")
 
         _, cb_url, _, _ = self._open_http(
             "GET",
@@ -860,6 +888,7 @@ class HuaweiCasAuthenticator:
         if _is_home_url(cb_url):
             return cb_url
 
+        cb_url = _validate_huawei_https_url(cb_url, label="oauth2 callback")
         parsed_cb = urlparse(cb_url)
         cb_origin = f"{parsed_cb.scheme or 'https'}://{parsed_cb.netloc}"
         cb_qs = parsed_cb.query
@@ -870,6 +899,7 @@ class HuaweiCasAuthenticator:
             raise AuthExpiredError(
                 f"OAuth2 login 未返回 homeTransit 跳转地址: {sorted(login_res.keys())}"
             )
+        code_url = _validate_huawei_https_url(code_url, label="oauth2 homeTransit")
 
         _, final_home_url, _, _ = self._open_http(
             "GET",
@@ -893,6 +923,7 @@ class HuaweiCasAuthenticator:
         output_fn: Callable[[str], None] = print,
     ) -> AuthSession:
         if callback_url:
+            callback_url = _validate_huawei_https_url(callback_url, label="SSO callbackURL")
             status, final_url, _hdrs, _raw = self._open_http(
                 "GET",
                 callback_url,
@@ -1195,10 +1226,12 @@ class HuaweiCasAuthenticator:
                     if channels:
                         pending_state = pending.get("state") or {}
                         cb_url = self._submit_remote_login_2fa(
-                            str(pending["ajax_base"]),
+                            _validate_huawei_https_url(
+                                str(pending["ajax_base"]), label="pending ajax_base"
+                            ),
                             pending["login_form"],
                             pending_state,
-                            channels[0],
+                            _pick_pending_2fa_channel(channels),
                             str(pending.get("tips_scene_id") or ""),
                             interactive=interactive,
                             prompt_fn=prompt_fn,
@@ -1324,7 +1357,10 @@ class HuaweiCasAuthenticator:
             local_info = _normalize_local_info(page_info)
             state["local_info"] = local_info
             if local_info.get("localHttpsAjaxPath"):
-                resolved = urljoin(CAS_BASE_URL, str(local_info["localHttpsAjaxPath"]))
+                resolved = _validate_huawei_https_url(
+                    urljoin(CAS_BASE_URL, str(local_info["localHttpsAjaxPath"])),
+                    label="localHttpsAjaxPath",
+                )
                 ajax_base = resolved.rstrip("/") + "/ajaxHandler/"
 
             service = str(local_info.get("service") or iframe_params["service"])

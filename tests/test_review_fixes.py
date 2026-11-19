@@ -557,6 +557,7 @@ class ScanBehaviourTests(unittest.TestCase):
 
                 def expiring(url, headers, part_path, **kw):
                     attempts.append(url)
+                    server.auth_valid = False
                     from urllib.error import HTTPError
 
                     raise HTTPError(url, 401, "expired", {}, None)

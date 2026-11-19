@@ -118,6 +118,9 @@ class Notifier:
 
     @staticmethod
     def _default_http_post(url: str, body: bytes, headers: dict[str, str]) -> None:
+        parsed = urlparse(url)
+        if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(f"Refusing webhook URL with disallowed scheme: {url!r}")
         req = urllib.request.Request(url=url, data=body, headers=headers, method="POST")
         with urllib.request.urlopen(req, timeout=15.0) as resp:
             resp.read()

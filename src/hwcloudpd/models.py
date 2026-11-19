@@ -283,6 +283,15 @@ class SyncConfig:
         except ValueError as exc:
             errors.append(str(exc))
 
+        if self.webhook_url and self.webhook_url.strip():
+            from urllib.parse import urlparse
+
+            parsed = urlparse(self.webhook_url.strip())
+            if parsed.scheme.lower() not in {"http", "https"} or not parsed.netloc:
+                errors.append(
+                    f"无效 --webhook-url '{self.webhook_url}': 仅支持 http:// 或 https:// 协议"
+                )
+
         if errors:
             raise ConfigError("配置无效：\n  - " + "\n  - ".join(errors))
 

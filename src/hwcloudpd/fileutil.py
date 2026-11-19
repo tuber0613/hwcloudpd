@@ -4,7 +4,9 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 import hashlib
+import os
 from pathlib import Path
+import threading
 import time
 from typing import Iterator
 
@@ -68,3 +70,34 @@ def checksum_matches(checksum: str, sha256_hex: str, md5_hex: str) -> bool | Non
     if len(c) == 32:
         return c == md5_hex
     return None
+
+
+def write_secret_file_atomic(target: Path, content: str, *, mode: int = 0o600) -> None:
+    """Atomically write sensitive text with restricted permissions from creation (no TOCTOU)."""
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    fd = os.open(tmp_path, flags, mode)
+    try:
+        try:
+            os.fchmod(fd, mode)
+        except OSError:
+            pass
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fd = -1
+            fh.write(content)
+            fh.flush()
+        os.replace(tmp_path, target)
+    except Exception:
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise

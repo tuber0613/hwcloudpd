@@ -10,13 +10,12 @@ services:
     user: "${PUID:-0}:${PGID:-0}"
     # docker stop 时给正在下载的文件留出收尾时间（进度会落库，下次自动续传）
     stop_grace_period: 2m
-    # .env 中的所有变量都会原样传入容器（不再需要在这里逐个列出）
+    # .env 中的所有变量都会原样传入容器（不再需要在这里逐个列出；CRON_SCHEDULE 与 HWCLOUD_WATCH_INTERVAL 均在 .env 中配置）
     env_file:
       - .env
     environment:
       HWCLOUD_DIRECTORY: /photos
       HWCLOUD_CONFIG_DIR: /config
-      CRON_SCHEDULE: ${CRON_SCHEDULE:-0 */2 * * *}
     volumes:
       - ./config:/config
       - ./photos:/photos

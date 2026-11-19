@@ -74,6 +74,7 @@ class SyncDaemon:
         self._sync_lock = asyncio.Lock()
 
         self._auth_valid = False
+        self._ever_authenticated = False
         self._credentials_rejected = False
         # Time-based backoff for transient / unknown login failures.
         self._auto_relogin_blocked_until: float = 0.0
@@ -142,6 +143,7 @@ class SyncDaemon:
         """Atomically persist container health state for Docker HEALTHCHECK."""
         self.health_file.parent.mkdir(parents=True, exist_ok=True)
         payload = {
+            "mode": "daemon",
             "ok": not self._stop_event.is_set(),
             "auth_valid": self._auth_valid,
             "auth_block_reason": self._relogin_hard_block_reason,
@@ -246,14 +248,17 @@ class SyncDaemon:
         try:
             await asyncio.to_thread(self.authenticator.login, interactive=False)  # type: ignore[union-attr]
             await asyncio.to_thread(self.client.heartbeat_check)
+            was_ever_authed = self._ever_authenticated
             self._auth_valid = True
+            self._ever_authenticated = True
             self._relogin_failures = 0
             self._last_heartbeat_at = time.time()
             self._last_error = ""
             self._auth_ready_event.set()
             self.notifier.reset_auth_cooldown()
             self.write_health()
-            self._immediate_sync_event.set()
+            if was_ever_authed:
+                self._immediate_sync_event.set()
             logger.info("Silent auto-relogin succeeded; session restored.")
             return True
         except InvalidCredentialsError as exc:
@@ -305,13 +310,15 @@ class SyncDaemon:
         """Execute a single heartbeat/hot-reload check. Return True if session is healthy."""
         was_valid = self._auth_valid
         try:
-            reloaded = self.auth_manager.load_or_reload()
+            reloaded = await asyncio.to_thread(self.auth_manager.load_or_reload)
             await self._check_import_errors()
             if reloaded:
                 logger.info("Detected updated credentials on disk; validating session...")
                 self._auto_relogin_blocked_until = 0.0
             await asyncio.to_thread(self.client.heartbeat_check)
+            was_ever_authed = self._ever_authenticated
             self._auth_valid = True
+            self._ever_authenticated = True
             self._relogin_failures = 0
             self._relogin_hard_block_fp = None
             self._relogin_hard_block_reason = ""
@@ -320,8 +327,8 @@ class SyncDaemon:
             self._auth_ready_event.set()
             self.notifier.reset_auth_cooldown()
             self.write_health()
-            if not was_valid and reloaded:
-                # Credentials just recovered while running: kick off a sync promptly.
+            if not was_valid and reloaded and was_ever_authed:
+                # Credentials just recovered after a mid-run expiry: kick off a sync promptly.
                 self._immediate_sync_event.set()
             return True
         except AuthExpiredError as exc:
@@ -381,6 +388,17 @@ class SyncDaemon:
             try:
                 report = await asyncio.to_thread(engine.run_once, force_full_scan=force_full)
             except AuthExpiredError as exc:
+                self._auth_valid = False
+                self._auth_ready_event.clear()
+                if await self._try_silent_auto_relogin():
+                    return None
+                if (
+                    self._credentials_rejected
+                    or self._relogin_hard_block_fp is not None
+                    or time.monotonic() < self._auto_relogin_blocked_until
+                ):
+                    self.write_health()
+                    return None
                 await self._handle_auth_expired(str(exc))
                 return None
             except Exception as exc:

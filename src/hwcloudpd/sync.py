@@ -6,6 +6,7 @@ from concurrent.futures import CancelledError, Future, ThreadPoolExecutor, as_co
 from dataclasses import dataclass, field
 from datetime import datetime
 import fnmatch
+import json
 import logging
 import os
 from pathlib import Path
@@ -16,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from hwcloudpd.client import SYSTEM_ALBUM_NAMES, VIRTUAL_ALBUM_TYPE_MAP, HuaweiGalleryClient
 from hwcloudpd.exif import inject_exif_datetime_if_missing
-from hwcloudpd.fileutil import checksum_matches, hash_file
+from hwcloudpd.fileutil import LockTimeoutError, checksum_matches, exclusive_file_lock, hash_file
 from hwcloudpd.models import (
     AlbumInfo,
     AuthExpiredError,
@@ -49,6 +50,7 @@ logger = logging.getLogger(__name__)
 RECYCLE_ALBUM_ID = "default-album-3"
 PART_DIR_NAME = ".hwcloudpd-tmp"
 STALE_PART_MAX_AGE_SEC = 7 * 86400
+MAX_CLOUD_DELETE_RETRIES = 5
 
 
 def _matches_any_pattern(album: AlbumInfo, patterns: list[str]) -> bool:
@@ -117,11 +119,13 @@ class SyncEngine:
         store: StateStore,
         *,
         output_fn: Callable[[str], None] = print,
+        sync_lock_timeout_sec: float = 2.0,
     ) -> None:
         self.config = config
         self.client = client
         self.store = store
         self.output_fn = output_fn
+        self._sync_lock_timeout = max(0.0, float(sync_lock_timeout_sec))
         self._tz = ZoneInfo(config.timezone)
         self._stop = threading.Event()
         self._abort = threading.Event()
@@ -359,6 +363,8 @@ class SyncEngine:
                     raw_stub.owner_id = raw_stub.owner_id or album.owner_id
                     raw_stub.is_shared = raw_stub.is_shared or album.is_shared
                 raw_stub.is_shared = raw_stub.is_shared or source.is_shared
+                if source.album_id == "default-album-virtual-favorite":
+                    raw_stub.is_fav = 1
 
                 if ctx.recent_remaining is not None:
                     if ctx.recent_remaining <= 0:
@@ -367,6 +373,8 @@ class SyncEngine:
                     ctx.recent_remaining -= 1
 
                 for stub in self._expand_burst_if_needed(raw_stub):
+                    if source.album_id == "default-album-virtual-favorite":
+                        stub.is_fav = 1
                     ctx.visible_uids.add(stub.unique_id)
                     if stub.album_id in ctx.excluded_ids or stub.unique_id in ctx.seen_uids:
                         continue
@@ -415,10 +423,72 @@ class SyncEngine:
             # Visible in a normal album again -> the user restored it from the Recycle Bin.
             logger.info("Cloud item %s is visible again (restored); marking present", stub.unique_id)
             self.store.set_cloud_state([stub.unique_id], CLOUD_PRESENT)
+        if not ctx.is_dry and int(rec.get("is_fav") or 0) != (1 if stub.is_fav else 0):
+            self.store.update_is_fav(stub.unique_id, stub.is_fav)
         if ctx.full_scan and self.config.photo_size == "original":
             ctx.verify.append(stub)
             if len(ctx.verify) >= self.VERIFY_BATCH_SIZE:
                 self._flush_verify(ctx)
+
+    def _enqueue_due_failures(self, ctx: _RunContext, target_albums: list[AlbumInfo]) -> None:
+        """Retry previously failed items whose backoff elapsed, even if --until-found stopped early."""
+        if self.config.recent is not None:
+            return
+        due = self.store.get_due_failures()
+        if not due:
+            return
+        selected_ids = {a.album_id for a in target_albums}
+        selected_virtuals = {a.album_id for a in target_albums if a.is_virtual}
+        for row in due:
+            uid = str(row.get("unique_id") or "")
+            if not uid or uid in ctx.seen_uids:
+                continue
+            raw_stub = str(row.get("stub_json") or "").strip()
+            if not raw_stub:
+                continue
+            try:
+                data = json.loads(raw_stub)
+                if not isinstance(data, dict):
+                    continue
+            except ValueError:
+                continue
+            album_id = str(data.get("album_id") or "")
+            if not album_id or album_id in ctx.excluded_ids:
+                continue
+            file_type = str(data.get("file_type") or "1")
+            is_fav = int(data.get("is_fav") or 0)
+            if self.config.albums and album_id not in selected_ids:
+                matches_virtual = (
+                    "default-album-all-photos" in selected_virtuals
+                    or ("default-album-virtual-video" in selected_virtuals and file_type == "4")
+                    or ("default-album-virtual-favorite" in selected_virtuals and is_fav == 1)
+                )
+                if not matches_virtual:
+                    continue
+            if self._synced_record(uid) is not None:
+                self.store.clear_failure(uid)
+                continue
+            album = ctx.album_by_id.get(album_id)
+            stub = MediaStub(
+                unique_id=uid,
+                album_id=album_id,
+                album_name=ctx.name_by_id.get(album_id, str(data.get("album_name") or album_id)),
+                file_type=file_type,
+                create_time_ms=int(data.get("create_time_ms") or 0),
+                is_cover=int(data.get("is_cover") or 0),
+                is_fav=is_fav,
+                file_name=str(data.get("file_name") or ""),
+                album_version=str(data.get("album_version") or (album.album_version if album else "")),
+                owner_id=(data.get("owner_id") or (album.owner_id if album else None)) or None,
+                is_shared=bool(data.get("is_shared")) or bool(album and album.is_shared),
+            )
+            if not self._passes_stub_filters(stub):
+                continue
+            ctx.seen_uids.add(uid)
+            ctx.report.scanned += 1
+            ctx.pending.append(stub)
+            if len(ctx.pending) >= self.BATCH_SIZE:
+                self._flush_pending(ctx)
 
     # ------------------------------------------------------------------ batches
 
@@ -459,6 +529,7 @@ class SyncEngine:
                     item.file_name,
                     item.unique_id,
                 )
+                ctx.report.skipped_existing = max(0, ctx.report.skipped_existing - 1)
                 ctx.replace_uids.add(item.unique_id)
                 changed.append(item)
         self._process_items(changed, ctx)
@@ -533,7 +604,20 @@ class SyncEngine:
 
     def _record_item_failure(self, item: MediaItem, exc: Exception, ctx: _RunContext) -> None:
         ctx.report.failed += 1
-        attempts = self.store.record_failure(item.unique_id, str(exc))
+        stub_meta = {
+            "unique_id": item.unique_id,
+            "album_id": item.album_id,
+            "album_name": item.album_name,
+            "file_type": item.file_type,
+            "create_time_ms": item.create_time_ms,
+            "is_cover": item.is_cover,
+            "is_fav": item.is_fav,
+            "file_name": "" if item.name_synthesized else item.file_name,
+            "album_version": item.album_version,
+            "owner_id": item.owner_id,
+            "is_shared": item.is_shared,
+        }
+        attempts = self.store.record_failure(item.unique_id, str(exc), stub=stub_meta)
         logger.error(
             "Failed to download %s (%s) [attempt %d]: %s",
             item.file_name,
@@ -585,6 +669,17 @@ class SyncEngine:
 
     def _part_path(self, item: MediaItem) -> Path:
         safe_uid = sanitize_component(item.unique_id, fallback="item")
+        ver = (
+            item.checksum[:8]
+            if item.checksum
+            else (f"s{item.file_size}" if item.file_size > 0 else "")
+        )
+        if ver:
+            return (
+                self.config.directory
+                / PART_DIR_NAME
+                / f"{safe_uid}.{self.config.photo_size}.{ver}.hwpart"
+            )
         return self.config.directory / PART_DIR_NAME / f"{safe_uid}.{self.config.photo_size}.hwpart"
 
     def _rel(self, path: Path) -> str:
@@ -592,13 +687,20 @@ class SyncEngine:
 
     def _download_verified(self, item: MediaItem, part_path: Path):
         last_exc: Exception | None = None
+        stop_fn = lambda: self._stop.is_set() or self._abort.is_set()
         for attempt in range(2):
+            prev_size = part_path.stat().st_size if part_path.exists() else 0
             try:
                 url = self.client.get_download_url(item, self.config.photo_size)
-                dl_res = self.client.download_to_part(url, part_path)
+                dl_res = self.client.download_to_part(url, part_path, should_stop=stop_fn)
                 if self.config.photo_size == "original":
                     if item.file_size > 0 and dl_res.bytes_written != item.file_size:
-                        part_path.unlink(missing_ok=True)
+                        if dl_res.bytes_written > item.file_size or dl_res.bytes_written <= prev_size:
+                            # Overshot or made zero forward progress (e.g. corrupt truncated body):
+                            # discard the part file instead of looping on bad bytes.
+                            part_path.unlink(missing_ok=True)
+                        # On premature EOF with forward progress (prev_size < bytes_written < file_size),
+                        # keep part_path so the retry/next run resumes via HTTP Range.
                         raise HwCloudError(
                             f"Downloaded size mismatch for {item.file_name}: "
                             f"expected {item.file_size}, got {dl_res.bytes_written}"
@@ -617,8 +719,15 @@ class SyncEngine:
                 raise
             except Exception as exc:
                 last_exc = exc
-                if attempt == 0 and not self._stop.is_set():
+                if attempt == 0 and not self._stop.is_set() and not self._abort.is_set():
                     logger.warning("Retrying %s after error: %s", item.file_name, exc)
+                    if "HTTP 401" in str(exc) or "HTTP 403" in str(exc):
+                        try:
+                            self.client.pre_process(force=True)
+                        except AuthExpiredError:
+                            raise
+                        except Exception:
+                            pass
                     time.sleep(0.5)
                     continue
                 raise
@@ -634,7 +743,7 @@ class SyncEngine:
             size_variant=self.config.photo_size,
         )
         mtime = item.create_time_ms / 1000.0 if item.create_time_ms > 0 else None
-        self._postprocess(item, decision.path, self._item_datetime(item), mtime, only_missing=True)
+        self._postprocess(item, decision.path, self._item_datetime(item), mtime, ctx, only_missing=True)
         return "adopted", decision.path
 
     def _process_item(self, item: MediaItem, ctx: _RunContext) -> tuple[str, Path]:
@@ -668,6 +777,8 @@ class SyncEngine:
         # 2. Download into a stable, uid-based part file (resumable across runs).
         part_path = self._part_path(item)
         part_path.parent.mkdir(parents=True, exist_ok=True)
+        if replacing and not item.checksum and item.file_size <= 0:
+            part_path.unlink(missing_ok=True)
         dl_res = self._download_verified(item, part_path)
 
         if item.name_synthesized and dl_res.content_disposition_filename:
@@ -690,25 +801,44 @@ class SyncEngine:
         os.utime(part_path, (mtime_sec, mtime_sec))
 
         # 4. Resolve the final name and commit file + DB record together under the path lock.
+        old_rel_to_clean: str | None = None
+        old_extras_to_clean: list[str] = []
         with ctx.path_lock:
+            prev_rec = self.store.get_record(item.unique_id) if replacing else None
             decision = _resolve(self._allow_adopt(item, ctx))
             if decision.adopt:
                 part_path.unlink(missing_ok=True)
                 ctx.reserved.add(decision.path)
                 return self._adopt(item, decision, ctx)
             target_path = decision.path
+            new_rel = self._rel(target_path)
             ctx.reserved.add(target_path)
             target_path.parent.mkdir(parents=True, exist_ok=True)
             os.replace(part_path, target_path)
+            moved_path = bool(
+                prev_rec
+                and prev_rec.get("local_rel_path")
+                and prev_rec["local_rel_path"] != new_rel
+            )
             self.store.upsert_downloaded(
                 item,
-                local_rel_path=self._rel(target_path),
+                local_rel_path=new_rel,
                 local_sha256=final_sha,
                 size_variant=self.config.photo_size,
+                extra_paths=[] if moved_path else None,
             )
+            if moved_path and prev_rec is not None:
+                old_rel_to_clean = str(prev_rec["local_rel_path"])
+                old_extras_to_clean = StateStore.extra_paths_of(prev_rec)
+
+        if old_rel_to_clean:
+            self._safe_local_delete(old_rel_to_clean, item.unique_id)
+            for rel in old_extras_to_clean:
+                if rel != new_rel:
+                    self._safe_local_delete(rel, item.unique_id)
 
         # 5. Best-effort post-processing: failures never un-commit the backup.
-        self._postprocess(item, target_path, dt, mtime_sec)
+        self._postprocess(item, target_path, dt, mtime_sec, ctx)
         return ("changed" if replacing else "downloaded"), target_path
 
     def _postprocess(
@@ -717,6 +847,7 @@ class SyncEngine:
         target_path: Path,
         dt: datetime,
         mtime_sec: float | None,
+        ctx: _RunContext,
         *,
         only_missing: bool = False,
     ) -> None:
@@ -726,16 +857,40 @@ class SyncEngine:
             item.is_live_photo or target_path.suffix.lower() in {".jpg", ".jpeg"}
         ):
             out_path = motion_video_path(target_path, policy)
+            rel_out = self._rel(out_path)
             try:
-                owner = self.store.find_by_rel_path(self._rel(out_path))
-                if owner is not None and owner["unique_id"] != item.unique_id:
-                    logger.warning(
-                        "Not extracting Motion Photo video to %s: path belongs to another item",
-                        out_path,
-                    )
-                elif only_missing and out_path.exists():
-                    extras.append(self._rel(out_path))
-                else:
+                should_extract = False
+                with ctx.path_lock:
+                    owner = self.store.find_by_rel_path(rel_out)
+                    item_rec = self.store.get_record(item.unique_id)
+                    own_extras = set(StateStore.extra_paths_of(item_rec)) if item_rec else set()
+                    if out_path in ctx.reserved:
+                        logger.warning(
+                            "Not extracting Motion Photo video to %s: path reserved by another task",
+                            out_path,
+                        )
+                    elif owner is not None and owner["unique_id"] != item.unique_id:
+                        logger.warning(
+                            "Not extracting Motion Photo video to %s: path belongs to another item",
+                            out_path,
+                        )
+                    elif out_path.exists():
+                        if rel_out in own_extras:
+                            if only_missing:
+                                extras.append(rel_out)
+                            else:
+                                ctx.reserved.add(out_path)
+                                should_extract = True
+                        else:
+                            logger.warning(
+                                "Not extracting Motion Photo video to %s: untracked local file already exists",
+                                out_path,
+                            )
+                    else:
+                        ctx.reserved.add(out_path)
+                        should_extract = True
+
+                if should_extract:
                     produced = extract_motion_photo_video(target_path, policy, mtime_sec=mtime_sec)
                     if produced is not None:
                         extras.append(self._rel(produced))
@@ -773,21 +928,41 @@ class SyncEngine:
                 recycled[stub.unique_id] = stub
         return recycled
 
-    def _reconcile_pending_deletes(self, recycled: dict[str, MediaStub], ctx: _RunContext) -> None:
-        """Resolve cloud deletions whose outcome was unknown (crash / network error)."""
-        pending = self.store.iter_records(status=None, cloud_states=[CLOUD_DELETE_PENDING])
-        if not pending or ctx.is_dry:
+    def _reconcile_pending_deletes(
+        self,
+        recycled: dict[str, MediaStub],
+        ctx: _RunContext,
+        *,
+        defer_missing_to_full_scan: bool = False,
+    ) -> None:
+        """Resolve cloud deletions whose outcome was unknown or previously failed."""
+        if ctx.is_dry:
             return
-        confirmed = [r["unique_id"] for r in pending if r["unique_id"] in recycled]
-        not_deleted = [r["unique_id"] for r in pending if r["unique_id"] not in recycled]
-        self.store.set_cloud_state(confirmed, CLOUD_DELETED)
-        self.store.set_cloud_state(not_deleted, CLOUD_DELETE_FAILED)
-        logger.info(
-            "Reconciled %d pending cloud deletions: %d confirmed in Recycle Bin, %d still in cloud",
-            len(pending),
-            len(confirmed),
-            len(not_deleted),
-        )
+        pending = self.store.iter_records(status=None, cloud_states=[CLOUD_DELETE_PENDING])
+        if pending:
+            confirmed = [r["unique_id"] for r in pending if r["unique_id"] in recycled]
+            not_in_recycle = [r["unique_id"] for r in pending if r["unique_id"] not in recycled]
+            self.store.set_cloud_state(confirmed, CLOUD_DELETED)
+            if not defer_missing_to_full_scan:
+                self.store.set_cloud_state(not_in_recycle, CLOUD_DELETE_FAILED)
+            logger.info(
+                "Reconciled %d pending cloud deletions: %d confirmed in Recycle Bin, %d not in Recycle Bin",
+                len(pending),
+                len(confirmed),
+                len(not_in_recycle),
+            )
+
+        # If a previously failed move-mode deletion is now in the Recycle Bin (e.g., delayed
+        # server processing or user recycled it), converge it to CLOUD_DELETED instead of retrying.
+        failed = self.store.iter_records(status=None, cloud_states=[CLOUD_DELETE_FAILED])
+        if failed:
+            now_recycled = [r["unique_id"] for r in failed if r["unique_id"] in recycled]
+            if now_recycled:
+                self.store.set_cloud_state(now_recycled, CLOUD_DELETED)
+                logger.info(
+                    "Converged %d previously failed cloud deletion(s) now present in Recycle Bin",
+                    len(now_recycled),
+                )
 
     def _safe_local_delete(self, rel: str, unique_id: str) -> bool:
         """Delete a local file only if no *other* record claims that path."""
@@ -860,10 +1035,17 @@ class SyncEngine:
 
         candidates: list[MediaItem] = []
         skipped_shared = 0
+        selected_virtuals = {a.album_id for a in target_albums if a.is_virtual}
         for rec in records:
             if rec["status"] != STATUS_DOWNLOADED:
                 continue
-            if (rec.get("cloud_state") or CLOUD_PRESENT) not in (CLOUD_PRESENT, CLOUD_DELETE_FAILED):
+            cloud_state = rec.get("cloud_state") or CLOUD_PRESENT
+            if cloud_state not in (CLOUD_PRESENT, CLOUD_DELETE_FAILED):
+                continue
+            if (
+                cloud_state == CLOUD_DELETE_FAILED
+                and int(rec.get("cloud_delete_attempts") or 0) >= MAX_CLOUD_DELETE_RETRIES
+            ):
                 continue
             if rec["size_variant"] != "original":
                 continue
@@ -872,8 +1054,15 @@ class SyncEngine:
             if album_id in ctx.excluded_ids:
                 continue
             if self.config.albums and album_id not in selected_ids:
-                # Virtual album selections (favorites, all photos) cover every real album.
-                if not any(a.is_virtual for a in target_albums):
+                matches_virtual = (
+                    "default-album-all-photos" in selected_virtuals
+                    or ("default-album-virtual-video" in selected_virtuals and rec["file_type"] == "4")
+                    or (
+                        "default-album-virtual-favorite" in selected_virtuals
+                        and int(rec.get("is_fav") or 0) == 1
+                    )
+                )
+                if not matches_virtual:
                     continue
             album = ctx.album_by_id.get(album_id)
             is_shared = bool(rec.get("is_shared")) or bool(album and album.is_shared)
@@ -884,11 +1073,29 @@ class SyncEngine:
             try:
                 if not local.is_file():
                     continue
+                st_size = local.stat().st_size
                 size = int(rec["file_size"] or 0)
                 exif_may_differ = self.config.set_exif_datetime and local.suffix.lower() in {".jpg", ".jpeg"}
-                if size > 0 and local.stat().st_size != size and not exif_may_differ:
-                    logger.warning("Local copy %s does not match cloud size; keeping cloud original", local)
-                    continue
+                if size > 0:
+                    if exif_may_differ:
+                        if st_size < size:
+                            logger.warning(
+                                "Local JPEG %s is smaller than cloud original (%d < %d); keeping cloud original",
+                                local,
+                                st_size,
+                                size,
+                            )
+                            continue
+                        recorded_sha = str(rec.get("local_sha256") or "").strip().lower()
+                        if recorded_sha and hash_file(local)[0] != recorded_sha:
+                            logger.warning(
+                                "Local JPEG %s checksum does not match recorded backup; keeping cloud original",
+                                local,
+                            )
+                            continue
+                    elif st_size != size:
+                        logger.warning("Local copy %s does not match cloud size; keeping cloud original", local)
+                        continue
             except OSError:
                 continue
             candidates.append(
@@ -929,6 +1136,7 @@ class SyncEngine:
         result = self.client.delete_cloud_files(candidates)
         self.store.set_cloud_state(result.deleted, CLOUD_DELETED)
         self.store.set_cloud_state(result.failed, CLOUD_DELETE_FAILED)
+        self.store.increment_cloud_delete_attempts(result.failed)
         ctx.report.deleted_cloud += len(result.deleted)
         logger.info(
             "Moved %d backed-up items to Huawei Cloud Recycle Bin (%d rejected, %d unknown)",
@@ -941,9 +1149,21 @@ class SyncEngine:
 
     def _mark_missing(self, recycled: dict[str, MediaStub], ctx: _RunContext) -> None:
         """Flag records that are no longer visible anywhere in the cloud (no local deletion)."""
+        records = self.store.iter_records(
+            status=STATUS_DOWNLOADED,
+            cloud_states=[CLOUD_PRESENT, CLOUD_DELETE_FAILED, CLOUD_DELETE_PENDING],
+        )
+        still_present_pending = [
+            r["unique_id"]
+            for r in records
+            if r.get("cloud_state") == CLOUD_DELETE_PENDING and r["unique_id"] in ctx.visible_uids
+        ]
+        if still_present_pending and not ctx.is_dry:
+            self.store.set_cloud_state(still_present_pending, CLOUD_DELETE_FAILED)
+
         missing = [
             r["unique_id"]
-            for r in self.store.iter_records(status=STATUS_DOWNLOADED, cloud_states=[CLOUD_PRESENT])
+            for r in records
             if r["unique_id"] not in ctx.visible_uids and r["unique_id"] not in recycled
         ]
         if not missing:
@@ -975,9 +1195,22 @@ class SyncEngine:
 
     def run_once(self, *, force_full_scan: bool = False) -> SyncReport:
         """Execute a complete synchronization pass and return a SyncReport."""
+        is_dry = self.config.dry_run or self.config.only_print_filenames
+        if is_dry:
+            return self._run_once_locked(force_full_scan=force_full_scan, is_dry=True)
+
+        lock_path = self.config.config_dir / "sync.lock"
+        try:
+            with exclusive_file_lock(lock_path, timeout_sec=self._sync_lock_timeout):
+                return self._run_once_locked(force_full_scan=force_full_scan, is_dry=False)
+        except LockTimeoutError as exc:
+            raise HwCloudError(
+                f"另一个 hwcloudpd 同步进程正在运行（无法获取 {lock_path}），请等待其完成后重试"
+            ) from exc
+
+    def _run_once_locked(self, *, force_full_scan: bool, is_dry: bool) -> SyncReport:
         started = time.monotonic()
         report = SyncReport(full_scan=force_full_scan)
-        is_dry = self.config.dry_run or self.config.only_print_filenames
         self._abort.clear()
 
         self.config.directory.mkdir(parents=True, exist_ok=True)
@@ -1002,6 +1235,9 @@ class SyncEngine:
             has_pending_deletes = bool(
                 self.store.iter_records(status=None, cloud_states=[CLOUD_DELETE_PENDING])
             )
+            has_delete_failed = bool(
+                self.store.iter_records(status=None, cloud_states=[CLOUD_DELETE_FAILED])
+            )
             detect_missing = (
                 force_full_scan
                 and not self.config.albums
@@ -1009,15 +1245,18 @@ class SyncEngine:
                 and not self.config.skip_bursts
             )
             recycled: dict[str, MediaStub] | None = None
-            if self.config.auto_delete or has_pending_deletes or detect_missing:
+            if self.config.auto_delete or has_pending_deletes or has_delete_failed or detect_missing:
                 recycled = self._list_recycle_bin()
-            if has_pending_deletes and recycled is not None:
-                self._reconcile_pending_deletes(recycled, ctx)
+            if (has_pending_deletes or has_delete_failed) and recycled is not None:
+                self._reconcile_pending_deletes(
+                    recycled, ctx, defer_missing_to_full_scan=detect_missing
+                )
 
             for source in self._build_sources(target_albums):
                 if ctx.recent_remaining is not None and ctx.recent_remaining <= 0:
                     break
                 self._scan_source(source, ctx)
+            self._enqueue_due_failures(ctx, target_albums)
             self._flush_pending(ctx)
             self._flush_verify(ctx)
 

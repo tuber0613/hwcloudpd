@@ -19,7 +19,7 @@ COPY src ./src
 RUN printf '#!/bin/sh\nexec python3 -m hwcloudpd "$@"\n' > /usr/local/bin/hwcloudpd \
     && chmod +x /usr/local/bin/hwcloudpd \
     && mkdir -p /config /photos \
-    && chmod 0777 /config /photos
+    && chmod 0755 /config /photos
 
 # Run as any UID/GID (compose `user: "${PUID}:${PGID}"`) - nothing in the image needs root.
 VOLUME ["/config", "/photos"]

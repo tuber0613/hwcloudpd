@@ -77,7 +77,7 @@ class AuthCurlTests(unittest.TestCase):
             self.assertEqual(session.user_id, "80086000000000001")
             self.assertTrue(mgr.auth_file.exists())
             self.assertFalse(curl_path.exists())
-            self.assertTrue((cfg_dir / "curl.txt.imported").exists())
+            self.assertFalse((cfg_dir / "curl.txt.imported").exists())
 
             # Rotate CSRFToken and Set-Cookie from HTTP response
             changed = mgr.update_from_response(

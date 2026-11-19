@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 _MACROS = {
@@ -94,8 +94,9 @@ def _parse_field(
             start, end = min_val, max_val
         elif "-" in range_part:
             left, right = range_part.split("-", 1)
-            start = _parse_atom(left, min_val, max_val, names, is_dow=False)
-            end = _parse_atom(right, min_val, max_val, names, is_dow=False)
+            range_max = 7 if is_dow else max_val
+            start = _parse_atom(left, min_val, range_max, names, is_dow=False)
+            end = _parse_atom(right, min_val, range_max, names, is_dow=False)
             if is_dow and end == 7 and start <= 7:
                 # Allow ranges like 1-7 or 5-7 where 7 maps to Sunday (0).
                 for v in range(start, end + 1, step):
@@ -148,7 +149,7 @@ class CronSchedule:
         hours, _ = _parse_field(parts[1], 0, 23)
         doms, dom_wild = _parse_field(parts[2], 1, 31)
         months, _ = _parse_field(parts[3], 1, 12, names=_MONTH_NAMES)
-        dows, dow_wild = _parse_field(parts[4], 0, 7, names=_DOW_NAMES, is_dow=True)
+        dows, dow_wild = _parse_field(parts[4], 0, 6, names=_DOW_NAMES, is_dow=True)
         return cls(
             expression=cleaned,
             minutes=minutes,
@@ -183,39 +184,63 @@ class CronSchedule:
             and dt.minute in self.minutes
         )
 
+    @staticmethod
+    def _is_real_local_time(dt: datetime, tz) -> bool:
+        """Return False if `dt` falls in a DST spring-forward gap (nonexistent wall time)."""
+        rt = dt.astimezone(timezone.utc).astimezone(tz)
+        return (rt.year, rt.month, rt.day, rt.hour, rt.minute) == (
+            dt.year,
+            dt.month,
+            dt.day,
+            dt.hour,
+            dt.minute,
+        )
+
     def next_after(self, after: datetime, tz_name: str = "UTC") -> datetime:
-        """Return the earliest datetime strictly after `after` matching this cron schedule."""
+        """Return the earliest real timezone-aware datetime strictly after `after` matching this schedule."""
         tz = ZoneInfo(tz_name) if after.tzinfo is None else after.tzinfo
         base = after.astimezone(tz) if after.tzinfo is not None else after.replace(tzinfo=tz)
-        candidate = base.replace(second=0, microsecond=0) + timedelta(minutes=1)
+        # Advance by 1 real minute in UTC so DST fall-back / spring-forward boundaries are exact.
+        base_utc = base.astimezone(timezone.utc)
+        candidate = (base_utc.replace(second=0, microsecond=0) + timedelta(minutes=1)).astimezone(tz)
 
-        # Bound search to 4 years (+ 1 day for leap years) so invalid dates like Feb 31 fail fast.
-        limit = candidate + timedelta(days=366 * 4 + 2)
-        while candidate < limit:
+        # Bound search to 4 years (+ 2 days for leap years) so invalid dates like Feb 31 fail fast.
+        limit_utc = base_utc + timedelta(days=366 * 4 + 2)
+        while candidate.astimezone(timezone.utc) < limit_utc:
+            if not self._is_real_local_time(candidate, tz):
+                # Wall-clock jump landed inside a spring-forward gap: normalize to real local time.
+                candidate = candidate.astimezone(timezone.utc).astimezone(tz)
+                continue
+
             if candidate.month not in self.months:
                 if candidate.month == 12:
                     candidate = candidate.replace(
-                        year=candidate.year + 1, month=1, day=1, hour=0, minute=0
+                        year=candidate.year + 1, month=1, day=1, hour=0, minute=0, fold=0
                     )
                 else:
                     candidate = candidate.replace(
-                        month=candidate.month + 1, day=1, hour=0, minute=0
+                        month=candidate.month + 1, day=1, hour=0, minute=0, fold=0
                     )
                 continue
 
             if not self._day_matches(candidate):
-                next_day = (candidate + timedelta(days=1)).replace(hour=0, minute=0)
-                candidate = next_day
+                candidate = (candidate.replace(hour=0, minute=0, fold=0) + timedelta(days=1)).replace(
+                    hour=0, minute=0, fold=0
+                )
                 continue
 
             if candidate.hour not in self.hours:
-                next_hour = (candidate + timedelta(hours=1)).replace(minute=0)
-                candidate = next_hour
+                # Step to the next real hour boundary via UTC so fall-back folds aren't skipped
+                # and spring-forward gaps are bridged cleanly.
+                mins_to_next_hour = 60 - candidate.minute
+                candidate = (
+                    candidate.astimezone(timezone.utc) + timedelta(minutes=mins_to_next_hour)
+                ).astimezone(tz)
                 continue
 
             if candidate.minute in self.minutes:
                 return candidate
 
-            candidate += timedelta(minutes=1)
+            candidate = (candidate.astimezone(timezone.utc) + timedelta(minutes=1)).astimezone(tz)
 
         raise ValueError(f"Cron expression '{self.expression}' has no matching date within 4 years")

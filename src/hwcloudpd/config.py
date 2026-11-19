@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 import os
 import re
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 _SIZE_RE = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*([a-zA-Z]*)\s*$")
 _SIZE_UNITS = {
@@ -60,7 +60,10 @@ def parse_date_bound(value: str | None, tz_name: str = "Asia/Shanghai", *, end_o
         num = int(raw)
         return num if num >= 10**12 else num * 1000
 
-    tz = ZoneInfo(tz_name)
+    try:
+        tz = ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError) as exc:
+        raise ValueError(f"无效时区 '{tz_name}': {exc}") from exc
     # Handle YYYY-MM-DD specifically so end_of_day can include the full calendar day.
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
         dt = datetime.strptime(raw, "%Y-%m-%d").replace(tzinfo=tz)
@@ -119,7 +122,9 @@ def env_bool(name: str, default: bool = False) -> bool:
         return True
     if val in {"0", "false", "no", "n", "off"}:
         return False
-    return default
+    raise ValueError(
+        f"环境变量 {name}={raw!r} 不是合法布尔值（支持 true/false/1/0/yes/no/on/off）"
+    )
 
 
 def env_int(name: str, default: int | None = None) -> int | None:

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import struct
+import threading
 import xml.etree.ElementTree as ET
 
 from hwcloudpd.fileutil import checksum_matches, hash_file
@@ -18,11 +19,29 @@ _UNSAFE_FILENAME_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 _KNOWN_MP4_BOXES = {b"moov", b"mdat", b"free", b"skip", b"wide", b"uuid", b"meta", b"pdin"}
 
 
-def sanitize_component(name: str, *, fallback: str = "unnamed") -> str:
+def _truncate_utf8(text: str, max_bytes: int) -> str:
+    if max_bytes <= 0:
+        return ""
+    encoded = text.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return text
+    return encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip(". ")
+
+
+def sanitize_component(name: str, *, fallback: str = "unnamed", max_bytes: int = 200) -> str:
     """Sanitize a filename or album folder component for POSIX/NAS filesystems."""
     cleaned = _UNSAFE_FILENAME_RE.sub("_", name).strip().strip(".")
     if not cleaned or cleaned in {".", ".."}:
         return fallback
+    if max_bytes > 0 and len(cleaned.encode("utf-8")) > max_bytes:
+        dot = cleaned.rfind(".")
+        ext = cleaned[dot:] if dot > 0 else ""
+        ext_bytes = len(ext.encode("utf-8"))
+        if ext and ext_bytes <= 32 and ext_bytes < max_bytes:
+            stem = _truncate_utf8(cleaned[:dot], max_bytes - ext_bytes)
+            cleaned = f"{stem}{ext}" if stem else fallback
+        else:
+            cleaned = _truncate_utf8(cleaned, max_bytes) or fallback
     return cleaned
 
 
@@ -237,11 +256,15 @@ def extract_motion_photo_video(
     else:  # "suffix"
         out_path = jpg_path.with_name(f"{jpg_path.stem}_HEVC.mp4")
 
-    tmp_path = out_path.with_name(f".{out_path.name}.part")
-    tmp_path.write_bytes(mp4_bytes)
-    if mtime_sec is not None and mtime_sec > 0:
-        os.utime(tmp_path, (mtime_sec, mtime_sec))
-    os.replace(tmp_path, out_path)
+    tmp_path = out_path.with_name(f".{out_path.name}.{os.getpid()}.{threading.get_ident()}.part")
+    try:
+        tmp_path.write_bytes(mp4_bytes)
+        if mtime_sec is not None and mtime_sec > 0:
+            os.utime(tmp_path, (mtime_sec, mtime_sec))
+        os.replace(tmp_path, out_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return out_path
 
 
@@ -284,7 +307,13 @@ def write_xmp_sidecar(media_path: Path, item: MediaItem, dt: datetime) -> Path:
     ) + b"\n"
 
     sidecar_path = Path(f"{media_path}.xmp")
-    tmp_path = sidecar_path.with_name(f".{sidecar_path.name}.tmp")
-    tmp_path.write_bytes(xml_bytes)
-    os.replace(tmp_path, sidecar_path)
+    tmp_path = sidecar_path.with_name(
+        f".{sidecar_path.name}.{os.getpid()}.{threading.get_ident()}.tmp"
+    )
+    try:
+        tmp_path.write_bytes(xml_bytes)
+        os.replace(tmp_path, sidecar_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
     return sidecar_path

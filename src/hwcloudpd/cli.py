@@ -438,14 +438,14 @@ def _configure_logging(level_name: str) -> None:
 
 def _run_healthcheck(ns: argparse.Namespace) -> int:
     """Docker HEALTHCHECK. Uses only raw CLI values so a broken config can't crash it."""
+    health_file = Path(ns.config_dir) / "health.json"
     is_daemon = bool((ns.cron or "").strip()) or bool(
         ns.watch_with_interval is not None and ns.watch_with_interval > 0
     )
-    if not is_daemon:
+    if not is_daemon and not health_file.exists():
         print("OK: one-shot mode (no daemon to monitor)")
         return 0
 
-    health_file = Path(ns.config_dir) / "health.json"
     if not health_file.exists():
         print(f"UNHEALTHY: missing {health_file}", file=sys.stderr)
         return 1
@@ -519,7 +519,7 @@ def main(argv: list[str] | None = None) -> int:
     try:
         config = args_to_config(ns)
         config.validate()
-    except (ConfigError, ValueError, OSError) as exc:
+    except (ConfigError, ValueError, KeyError, OSError) as exc:
         print(f"配置错误: {exc}", file=sys.stderr)
         return 2
 
@@ -569,6 +569,18 @@ def main(argv: list[str] | None = None) -> int:
             except HwCloudError as exc:
                 logger.warning("Could not verify existing session (%s); trying to log in", exc)
 
+        if not authenticator.has_credentials and authenticator.can_attempt_login:
+            try:
+                authenticator.login(interactive=interactive)
+                client.heartbeat_check()
+                print(f"Authenticated OK (auth file: {auth_manager.auth_file})")
+                return 0
+            except (AuthExpiredError, InvalidCredentialsError, HwCloudError) as exc:
+                if not interactive:
+                    print(f"Authentication failed: {exc}", file=sys.stderr)
+                    return 2
+                logger.warning("CASTGC SSO refresh failed (%s); prompting for credentials", exc)
+
         uname = config.username
         upass = config.password
         if not (uname and upass) and interactive:
@@ -584,9 +596,9 @@ def main(argv: list[str] | None = None) -> int:
                 login_timeout_sec=config.login_timeout_sec,
             )
 
-        if not authenticator.has_credentials:
+        if not authenticator.can_attempt_login:
             print(
-                "Authentication failed: no valid auth.json and HUAWEI_USERNAME / HUAWEI_PASSWORD are not set.",
+                "Authentication failed: no valid auth.json, no CASTGC cookie, and HUAWEI_USERNAME / HUAWEI_PASSWORD are not set.",
                 file=sys.stderr,
             )
             return 2

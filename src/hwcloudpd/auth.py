@@ -14,7 +14,7 @@ import threading
 import time
 from typing import Iterable
 
-from hwcloudpd.fileutil import exclusive_file_lock
+from hwcloudpd.fileutil import exclusive_file_lock, write_secret_file_atomic
 from hwcloudpd.models import AuthExpiredError, AuthSession
 
 logger = logging.getLogger(__name__)
@@ -290,7 +290,15 @@ class AuthManager:
     def _quarantine(self, path: Path, suffix: str) -> Path | None:
         target = path.with_name(f"{path.name}.{suffix}")
         try:
+            try:
+                os.chmod(path, 0o600)
+            except OSError:
+                pass
             os.replace(path, target)
+            try:
+                os.chmod(target, 0o600)
+            except OSError:
+                pass
             return target
         except OSError as exc:
             logger.warning("Could not move aside %s: %s", path, exc)
@@ -301,46 +309,44 @@ class AuthManager:
         with self._lock:
             changed = False
             if self.curl_file.exists():
-                try:
-                    curl_mtime = self.curl_file.stat().st_mtime
-                except OSError:
-                    curl_mtime = -1.0
-                if curl_mtime > self._last_curl_mtime or not self.auth_file.exists():
-                    raw_curl = self.curl_file.read_text(encoding="utf-8", errors="replace")
-                    if raw_curl.strip():
-                        prev_uid = self._session.user_id if self._session else ""
-                        prev_dev = self._session.device_id if self._session else ""
+                with self._file_lock():
+                    if self.curl_file.exists():
                         try:
-                            session = parse_curl_command(
-                                raw_curl,
-                                fallback_user_id=prev_uid,
-                                fallback_device_id=prev_dev,
-                            )
-                        except ValueError as exc:
-                            # Move the bad file aside so we don't re-parse (and re-log) it forever.
-                            moved = self._quarantine(self.curl_file, "invalid")
-                            self._last_curl_mtime = curl_mtime
-                            self.last_import_error = (
-                                f"{self.curl_file.name} 无法解析，已重命名为 "
-                                f"{moved.name if moved else self.curl_file.name}: {exc}"
-                            )
-                            logger.error("%s", self.last_import_error)
-                        else:
-                            self.save(session)
-                            imported_path = self.config_dir / "curl.txt.imported"
+                            raw_curl = self.curl_file.read_text(encoding="utf-8", errors="replace")
+                        except OSError:
+                            raw_curl = ""
+                        if raw_curl.strip():
+                            prev_uid = self._session.user_id if self._session else ""
+                            prev_dev = self._session.device_id if self._session else ""
                             try:
-                                os.replace(self.curl_file, imported_path)
-                            except OSError as exc:
-                                logger.warning("Could not archive %s: %s", self.curl_file, exc)
-                            self._last_curl_mtime = curl_mtime
-                            self.last_import_error = ""
-                            logger.info(
-                                "Imported credentials from %s into %s (userid=%s)",
-                                self.curl_file,
-                                self.auth_file,
-                                session.user_id,
-                            )
-                            return True
+                                session = parse_curl_command(
+                                    raw_curl,
+                                    fallback_user_id=prev_uid,
+                                    fallback_device_id=prev_dev,
+                                )
+                            except ValueError as exc:
+                                # Move the bad file aside (with 0600 perms) so we don't re-parse forever.
+                                moved = self._quarantine(self.curl_file, "invalid")
+                                self.last_import_error = (
+                                    f"{self.curl_file.name} 无法解析，已重命名为 "
+                                    f"{moved.name if moved else self.curl_file.name}: {exc}"
+                                )
+                                logger.error("%s", self.last_import_error)
+                            else:
+                                self._save_unlocked(session)
+                                try:
+                                    self.curl_file.unlink(missing_ok=True)
+                                except OSError as exc:
+                                    logger.warning("Could not delete %s after import: %s", self.curl_file, exc)
+                                self.last_import_error = ""
+                                logger.info(
+                                    "Imported credentials from %s into %s (userid=%s) and removed %s",
+                                    self.curl_file,
+                                    self.auth_file,
+                                    session.user_id,
+                                    self.curl_file.name,
+                                )
+                                return True
 
             if self.auth_file.exists():
                 try:
@@ -349,12 +355,17 @@ class AuthManager:
                     return False
                 if self._session is None or auth_mtime > self._last_auth_mtime:
                     try:
-                        data = json.loads(self.auth_file.read_text(encoding="utf-8"))
+                        raw_auth = self.auth_file.read_text(encoding="utf-8")
+                    except OSError:
+                        return False
+                    try:
+                        data = json.loads(raw_auth)
                         if not isinstance(data, dict):
                             raise ValueError("top-level JSON value is not an object")
                         session = AuthSession.from_dict(data)
                     except (ValueError, TypeError) as exc:
-                        moved = self._quarantine(self.auth_file, f"corrupt-{int(time.time())}")
+                        with self._file_lock():
+                            moved = self._quarantine(self.auth_file, f"corrupt-{int(time.time())}")
                         self.last_import_error = (
                             f"{self.auth_file.name} 已损坏（{exc}），已移至 "
                             f"{moved.name if moved else '?'}，需要重新登录"
@@ -387,16 +398,9 @@ class AuthManager:
             self._save_unlocked(session)
 
     def _save_unlocked(self, session: AuthSession) -> None:
-        self.config_dir.mkdir(parents=True, exist_ok=True)
         session.updated_at = time.time()
-        tmp_path = self.config_dir / f".auth.{os.getpid()}.{threading.get_ident()}.tmp"
         payload = json.dumps(session.to_dict(), ensure_ascii=False, indent=2) + "\n"
-        tmp_path.write_text(payload, encoding="utf-8")
-        try:
-            os.chmod(tmp_path, 0o600)
-        except OSError:
-            pass
-        os.replace(tmp_path, self.auth_file)
+        write_secret_file_atomic(self.auth_file, payload, mode=0o600)
         self._session = AuthSession.from_dict(session.to_dict())
         try:
             self._last_auth_mtime = self.auth_file.stat().st_mtime
